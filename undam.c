@@ -4,6 +4,7 @@
 #include "access/generic_xlog.h"
 #include "access/heapam.h"
 #include "access/multixact.h"
+#include "access/reloptions.h"
 #include "access/relscan.h"
 #include "access/skey.h"
 #include "access/tableam.h"
@@ -46,6 +47,7 @@ static int    UndamChunkSize;
 static int    UndamNAllocChains;
 static int    UndamMaxRelations;
 static HTAB*  UndamAllocChainsHash;
+static relopt_kind UndamReloptKind;
 
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 
@@ -263,7 +265,7 @@ UndamInsertTuple(Relation rel, int forknum, HeapTuple tuple)
 		/* ... and then head */
 		pos = UndamWriteData(rel, forknum, (char*)tuple->t_data, available, INVALID_POSITION, true, pos);
 	}
-	ItemPointerSet(&tuple->t_self, POSITION_GET_BLOCK_NUMBER(pos), POSITION_GET_BLOCK_OFFSET(pos)/UndamChunkSize);
+	ItemPointerSet(&tuple->t_self, POSITION_GET_BLOCK_NUMBER(pos), POSITION_GET_ITEM(pos));
 }
 
 /*
@@ -2707,7 +2709,7 @@ undam_scan_analyze_next_tuple(TableScanDesc scan, TransactionId OldestXmin,
 {
     UndamScanDesc uscan = (UndamScanDesc) scan;
     Relation      rel = scan->rs_rd;
-	int           pos = ItemPointerGetOffsetNumber(&uscan->curr_item);
+	int           item = ItemPointerGetOffsetNumber(&uscan->curr_item);
 	BlockNumber   blocknum = ItemPointerGetBlockNumber(&uscan->curr_item);
 	int           nChunks = CHUNKS_PER_BLOCK;
 	Buffer        buf = ReadBufferExtended(rel, MAIN_FORKNUM, blocknum, RBM_ZERO_ON_ERROR, NULL);
@@ -2715,11 +2717,11 @@ undam_scan_analyze_next_tuple(TableScanDesc scan, TransactionId OldestXmin,
 
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 
-	while (pos < nChunks)
+	while (item < nChunks)
 	{
-		if (pg->alloc_mask[pos >> 6] & ((uint64)1 << (pos & 63)))
+		if (pg->alloc_mask[item >> 6] & ((uint64)1 << (item & 63)))
 		{
-			UndamTupleHeader* tup = (UndamTupleHeader*)((char*)pg + pos*UndamChunkSize);
+			UndamTupleHeader* tup = (UndamTupleHeader*)((char*)pg + item*UndamChunkSize);
 			HeapTupleData tuphdr;
 			int len = HeapTupleHeaderGetDatumLength(&tup->hdr);
 			bool sample_it = false;
@@ -2727,7 +2729,7 @@ undam_scan_analyze_next_tuple(TableScanDesc scan, TransactionId OldestXmin,
 			tuphdr.t_tableOid = RelationGetRelid(rel);
 			tuphdr.t_data = &tup->hdr;
 			tuphdr.t_len = len;
-			ItemPointerSet(&tuphdr.t_self, blocknum, pos);
+			ItemPointerSet(&tuphdr.t_self, blocknum, item);
 
 			switch (HeapTupleSatisfiesVacuum(&tuphdr, OldestXmin, buf))
 			{
@@ -2845,7 +2847,7 @@ undam_scan_analyze_next_tuple(TableScanDesc scan, TransactionId OldestXmin,
 				return true;
 			}
 		}
-		pos += 1;
+		item += 1;
 	}
 	UnlockReleaseBuffer(buf);
 	return false;
@@ -3117,30 +3119,37 @@ void _PG_init(void)
 	if (!process_shared_preload_libraries_in_progress)
 		return;
 
-	DefineCustomIntVariable("undam.chunk_size",
+#ifdef TABLEAM_OPTOINS_SUPPORTED
+	UndamReloptKind = add_reloption_kind();
+	add_int_reloption(UndamReloptKind, "chunk", "Size of allocation chunk", 64, 64, BLCKSZ/8, AccessExclusiveLock);
+	add_int_reloption(UndamReloptKind, "chains", "Number of allocation chains", 8, 1,128, AccessExclusiveLock);
+#else
+       DefineCustomIntVariable("undam.chunk_size",
                             "Size of allocation chaunk.",
-							NULL,
-							&UndamChunkSize,
-							64,
-							64,
-							INT_MAX,
-							PGC_POSTMASTER,
-							0,
-							NULL,
-							NULL,
-							NULL);
-	DefineCustomIntVariable("undam.alloc_chains",
+                                                       NULL,
+                                                       &UndamChunkSize,
+                                                       64,
+                                                       64,
+                                                       BLCKSZ/8,
+                                                       PGC_POSTMASTER,
+                                                       0,
+                                                       NULL,
+                                                       NULL,
+                                                       NULL);
+       DefineCustomIntVariable("undam.alloc_chains",
                             "Number of allocation chains.",
-							NULL,
-							&UndamNAllocChains,
-							8,
-							1,
-							INT_MAX,
-							PGC_POSTMASTER,
-							0,
-							NULL,
-							NULL,
-							NULL);
+                                                       NULL,
+                                                       &UndamNAllocChains,
+                                                       8,
+                                                       1,
+                                                       128,
+                                                       PGC_POSTMASTER,
+                                                       0,
+                                                       NULL,
+                                                       NULL,
+                                                       NULL);
+#endif
+
 	DefineCustomIntVariable("undam.max_relations",
                             "Maximal number of relations.",
 							NULL,
@@ -3158,3 +3167,22 @@ void _PG_init(void)
 	shmem_startup_hook = UndamShmemStartup;
 }
 
+#ifdef TABLEAM_OPTOINS_SUPPORTED
+/*
+ * Parse reloptions for Undam table, producing a UndamOptions struct.
+ */
+bytea *
+undamoptions(Datum reloptions, bool validate)
+{
+	UndamOptions *rdopts;
+
+	/* Parse the user-given reloptions */
+	rdopts = (UndamOptions *) build_reloptions(reloptions, validate,
+											   UndamReloptKind,
+											   sizeof(UndamOptions),
+											   UndamReloptTab,
+											   lengthof(UndamReloptTab));
+
+	return (bytea *) rdopts;
+}
+#endif

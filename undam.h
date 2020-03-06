@@ -5,14 +5,20 @@
 
 typedef uint64_t UndamPosition;
 
-#define POSITION_GET_BLOCK_NUMBER(pos) ((BlockNumber)((pos)/BLCKSZ))
-#define POSITION_GET_BLOCK_OFFSET(pos) ((pos) & (BLCKSZ-1))
-#define POSITION_GET_ITEM(pos)         (POSITION_GET_BLOCK_OFFSET(pos) / UndamChunkSize)
-#define GET_POSITION(blocknum,pos)     ((UndamPosition)(blocknum)*BLCKSZ + (pos))
-#define POSITION_FROM_ITEMPOINTER(ip)  GET_POSITION(BlockIdGetBlockNumber(&(ip)->ip_blkid), (ip)->ip_posid*UndamChunkSize)
-#define INVALID_POSITION               GET_POSITION(InvalidBlockNumber, 0)
 #define CHUNKS_PER_BLOCK               (BLCKSZ/UndamChunkSize)
+#define POSITION_GET_BLOCK_NUMBER(pos) ((BlockNumber)((pos)/CHUNKS_PER_BLOCK))
+#define POSITION_GET_ITEM(pos)         ((uint32)((pos) % CHUNKS_PER_BLOCK))
+#define POSITION_GET_BLOCK_OFFSET(pos) (POSITION_GET_ITEM(pos)*UndamChunkSize)
+#define GET_POSITION(blocknum,item)    ((UndamPosition)(blocknum)*CHUNKS_PER_BLOCK + (item))
+#define POSITION_FROM_ITEMPOINTER(ip)  GET_POSITION(BlockIdGetBlockNumber(&(ip)->ip_blkid), (ip)->ip_posid)
+#define INVALID_POSITION               GET_POSITION(InvalidBlockNumber, 0)
 
+typedef struct
+{
+	int32		vl_len_;	 /* varlena header (do not touch directly!) */
+	int			chunkSize;	 /* chunk size */
+	int         allocChains; /* number of allocation chains */
+} UndamOptions;
 
 typedef struct
 {
