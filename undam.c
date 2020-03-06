@@ -46,7 +46,7 @@ void		_PG_init(void);
 static int    UndamChunkSize;
 static int    UndamNAllocChains;
 static int    UndamMaxRelations;
-static HTAB*  UndamAllocChainsHash;
+static HTAB*  UndamRelInfoHash;
 static relopt_kind UndamReloptKind;
 
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
@@ -59,14 +59,15 @@ static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 /*
  * Locate allocation chain for the relation and initialize first UndamNAllocChains blocks of relation of not initialized yet.
  */
-static UndamAllocChain*
-UndamGetAllocChain(Relation rel)
+static UndamRelationInfo*
+UndamGetRelationInfo(Relation rel)
 {
 	bool found;
-	UndamAllocHashEntry* entry = (UndamAllocHashEntry*)hash_search(UndamAllocChainsHash, &RelationGetRelid(rel), HASH_ENTER, &found);
+	UndamRelationInfo* relinfo = (UndamRelationInfo*)hash_search(UndamRelInfoHash, &RelationGetRelid(rel), HASH_ENTER, &found);
 	if (!found)
 	{
-		for (int chain = 0; chain < UndamNAllocChains; chain++)
+		int nAllocChains = UndamNAllocChains;
+		for (int chain = 0; chain < nAllocChains; chain++)
 		{
 			for (int fork = MAIN_FORKNUM; fork <= EXT_FORKNUM; fork++)
 			{
@@ -79,27 +80,26 @@ UndamGetAllocChain(Relation rel)
 				{
 					GenericXLogState* xlogState = GenericXLogStart(rel);
 					pg = (UndamPageHeader*)GenericXLogRegisterBuffer(xlogState, buf, 0);
-					entry->chains[chain].forks[fork].head = pg->head = chain;
-					entry->chains[chain].forks[fork].tail = pg->tail = chain + UndamNAllocChains*BLCKSZ;
+					relinfo->chunkSize = pg->chunkSize = UndamChunkSize;
+					relinfo->nChains = pg->nChains = UndamNAllocChains;
+					relinfo->chains[chain].forks[fork].head = pg->head = chain;
+					relinfo->chains[chain].forks[fork].tail = pg->tail = chain + UndamNAllocChains*BLCKSZ;
 					pg->next = InvalidBlockNumber;
 					pg->pd_special = pg->pd_lower = pg->pd_upper = sizeof(UndamPageHeader);
-					pg->chunk_size = UndamChunkSize;
-					pg->n_chains = UndamNAllocChains;
 					GenericXLogFinish(xlogState);
 				}
 				else
 				{
-					if (pg->chunk_size != UndamChunkSize || pg->n_chains != UndamNAllocChains)
-						elog(ERROR, "Allocation parameters for UNDO storage can not be changed without removing data of existed tables");
-
-					entry->chains[chain].forks[fork].head = pg->head;
-					entry->chains[chain].forks[fork].tail = pg->tail;
+					relinfo->chunkSize = pg->chunkSize;
+					relinfo->nChains = nAllocChains = pg->nChains;
+					relinfo->chains[chain].forks[fork].head = pg->head;
+					relinfo->chains[chain].forks[fork].tail = pg->tail;
 				}
 				UnlockReleaseBuffer(buf);
 			}
 		}
 	}
-	return entry->chains;
+	return relinfo;
 }
 
 /*
@@ -110,10 +110,10 @@ static BlockNumber
 UndamGetLastBlock(Relation rel, int fork)
 {
 	BlockNumber last = 0;
-	UndamAllocChain* chains = UndamGetAllocChain(rel);
-	for (int chain = 0; chain < UndamNAllocChains; chain++)
+	UndamRelationInfo* relinfo = UndamGetRelationInfo(rel);
+	for (int chain = 0; chain < N_ALLOC_CHAINS; chain++)
 	{
-		last = Max(last, chains[chain].forks[fork].tail);
+		last = Max(last, relinfo->chains[chain].forks[fork].tail);
 	}
 	return last;
 }
@@ -131,11 +131,11 @@ UndamShmemStartup(void)
     }
 	memset(&info, 0, sizeof(info));
 	info.keysize = sizeof(Oid);
-	info.entrysize = sizeof(Oid) + sizeof(UndamAllocChain)*UndamNAllocChains;
-	UndamAllocChainsHash =  ShmemInitHash("undam hash",
-										  UndamMaxRelations, UndamMaxRelations,
-										  &info,
-										  HASH_ELEM | HASH_BLOBS);
+	info.entrysize = sizeof(UndamRelationInfo);
+	UndamRelInfoHash =  ShmemInitHash("undam hash",
+									  UndamMaxRelations, UndamMaxRelations,
+									  &info,
+									  HASH_ELEM | HASH_BLOBS);
 }
 
 /*
@@ -147,14 +147,14 @@ static UndamPosition
 UndamWriteData(Relation rel, int forknum, char* data, size_t size, UndamPosition undoPos, bool isHeader, UndamPosition tailChunk)
 {
 	/* We use UndamTupleChunk for estimating of size of data stored in tuple, because head chunk is always written separately */
-	int chunkDataSize = UndamChunkSize - offsetof(UndamTupleChunk, data);
+	UndamRelationInfo* relinfo = UndamGetRelationInfo(rel);
+	int chunkDataSize = CHUNK_SIZE - offsetof(UndamTupleChunk, data);
 	int nChunks = (size + chunkDataSize - 1) / chunkDataSize;
-	UndamAllocChain* chains = UndamGetAllocChain(rel);
 	int available = size - (nChunks-1) * chunkDataSize;
  	do
 	{
-		int chainNo = random() % UndamNAllocChains; /* choose random chain to minimize probability of allocation chain buffer lock conflcits */
-		BlockNumber blocknum = chains[chainNo].forks[forknum].head;
+		int chainNo = random() % N_ALLOC_CHAINS; /* choose random chain to minimize probability of allocation chain buffer lock conflcits */
+		BlockNumber blocknum = relinfo->chains[chainNo].forks[forknum].head;
 		Buffer buf = ReadBufferExtended(rel, forknum, blocknum, RBM_ZERO_ON_ERROR, NULL);
 		GenericXLogState* xlogState = GenericXLogStart(rel);
 		UndamPageHeader* pg;
@@ -166,7 +166,7 @@ UndamWriteData(Relation rel, int forknum, char* data, size_t size, UndamPosition
 
 		if (PageIsNew(pg)) /* Lazy initialization of the page */
 		{
-			Assert(blocknum >= UndamNAllocChains); /* Root pages shoudl already be initialized */
+			Assert(blocknum >= N_ALLOC_CHAINS); /* Root pages shoudl already be initialized */
 			pg->pd_special = pg->pd_lower = pg->pd_upper = sizeof(UndamPageHeader);
 			pg->head = pg->tail = InvalidBlockNumber;
 			pg->next = InvalidBlockNumber;
@@ -180,13 +180,13 @@ UndamWriteData(Relation rel, int forknum, char* data, size_t size, UndamPosition
 			{
 				item -= 1;
 			}
-			while (pg->alloc_mask[item >> 6] & ((uint64)1 << (item & 63)));  /* first chunk is not allocated, so use it as barrier */
+			while (pg->allocMask[item >> 6] & ((uint64)1 << (item & 63)));  /* first chunk is not allocated, so use it as barrier */
 
 			if (item != 0)  /* has some free space */
 			{
 				if (isHeader)
 				{
-					UndamTupleHeader* tup = (UndamTupleHeader*)((char*)pg + item*UndamChunkSize);
+					UndamTupleHeader* tup = (UndamTupleHeader*)((char*)pg + item*CHUNK_SIZE);
 					memcpy(&tup->hdr, data, size);
 					tup->undo_chain = undoPos;
 					tup->next_chunk = tailChunk;
@@ -194,13 +194,13 @@ UndamWriteData(Relation rel, int forknum, char* data, size_t size, UndamPosition
 				}
 				else
 				{
-					UndamTupleChunk* chunk = (UndamTupleChunk*)((char*)pg + item*UndamChunkSize);
+					UndamTupleChunk* chunk = (UndamTupleChunk*)((char*)pg + item*CHUNK_SIZE);
 					memcpy(chunk->data, data + (nChunks-1)*chunkDataSize, available);
 					chunk->next = tailChunk;
 					available = chunkDataSize;
 				}
 				tailChunk = blocknum;
-				pg->alloc_mask[item >> 6] |= (uint64)1 << (item & 63);
+				pg->allocMask[item >> 6] |= (uint64)1 << (item & 63);
 				nChunks -= 1;
 			}
 			else
@@ -227,10 +227,10 @@ UndamWriteData(Relation rel, int forknum, char* data, size_t size, UndamPosition
 			{
 				if (nextFree == InvalidBlockNumber) /* No more free block in chain: use last one */
 				{
-					nextFree = chains[chainNo].forks[forknum].tail;
-					pg->tail = chains[chainNo].forks[forknum].tail += UndamNAllocChains*BLCKSZ;
+					nextFree = relinfo->chains[chainNo].forks[forknum].tail;
+					pg->tail = relinfo->chains[chainNo].forks[forknum].tail += N_ALLOC_CHAINS*BLCKSZ;
 				}
-				chains[chainNo].forks[forknum].head = pg->head = nextFree;
+				relinfo->chains[chainNo].forks[forknum].head = pg->head = nextFree;
 			}
 			item = CHUNKS_PER_BLOCK;
 		}
@@ -251,7 +251,8 @@ UndamWriteData(Relation rel, int forknum, char* data, size_t size, UndamPosition
 static void
 UndamInsertTuple(Relation rel, int forknum, HeapTuple tuple)
 {
-	int available = UndamChunkSize - offsetof(UndamTupleHeader, hdr);
+	UndamRelationInfo* relinfo = UndamGetRelationInfo(rel);
+	int available = CHUNK_SIZE - offsetof(UndamTupleHeader, hdr);
 	UndamPosition pos;
 
 	if (tuple->t_len <= available) /* Fit in one chunk */
@@ -275,8 +276,9 @@ UndamInsertTuple(Relation rel, int forknum, HeapTuple tuple)
 static void
 UndamUpdateTuple(Relation rel, HeapTuple tuple, Buffer buffer)
 {
-	int offs = tuple->t_self.ip_posid*UndamChunkSize;
-	int available = UndamChunkSize - offsetof(UndamTupleHeader, hdr);
+	UndamRelationInfo* relinfo = UndamGetRelationInfo(rel);
+	int offs = tuple->t_self.ip_posid*CHUNK_SIZE;
+	int available = CHUNK_SIZE - offsetof(UndamTupleHeader, hdr);
 	GenericXLogState* xlogState = GenericXLogStart(rel);
 	UndamPageHeader* pg = (UndamPageHeader*)GenericXLogRegisterBuffer(xlogState, buffer, 0);
 	UndamTupleHeader* old = (UndamTupleHeader*)((char*)pg + offs);
@@ -306,8 +308,9 @@ UndamUpdateTuple(Relation rel, HeapTuple tuple, Buffer buffer)
 static HeapTuple
 UndamReadTuple(Relation rel, Snapshot snapshot, ItemPointer ip)
 {
+	UndamRelationInfo* relinfo = UndamGetRelationInfo(rel);
 	BlockNumber blocknum = BlockIdGetBlockNumber(&ip->ip_blkid);
-	int offs = ip->ip_posid*UndamChunkSize;
+	int offs = ip->ip_posid*CHUNK_SIZE;
 	int forknum = MAIN_FORKNUM; /* Start from main fork */
 	HeapTupleData tuphdr;
 
@@ -330,7 +333,7 @@ UndamReadTuple(Relation rel, Snapshot snapshot, ItemPointer ip)
 		if (HeapTupleSatisfiesVisibility(&tuphdr, snapshot, buf))
 		{
 			HeapTuple tuple = (HeapTuple)palloc(sizeof(HeapTupleData) + len);
-			int available = UndamChunkSize - offsetof(UndamTupleHeader, hdr);
+			int available = CHUNK_SIZE - offsetof(UndamTupleHeader, hdr);
 
 			*tuple = tuphdr;
 			tuple->t_data = (HeapTupleHeader)(tuple + 1); /* store tuple's body just after the header */
@@ -346,7 +349,7 @@ UndamReadTuple(Relation rel, Snapshot snapshot, ItemPointer ip)
 				memcpy(dst, &tup->hdr, available);
 				dst += available;
 				len -= available;
-				available = UndamChunkSize - offsetof(UndamTupleChunk, data);
+				available = CHUNK_SIZE - offsetof(UndamTupleChunk, data);
 
 				/* Copy rest of chunks */
 				do {
@@ -380,11 +383,11 @@ UndamReadTuple(Relation rel, Snapshot snapshot, ItemPointer ip)
 static void
 UndamDeleteTuple(Relation rel, UndamPosition pos)
 {
+	UndamRelationInfo* relinfo = UndamGetRelationInfo(rel);
 	BlockNumber blocknum = POSITION_GET_BLOCK_NUMBER(pos);
 	int item = POSITION_GET_ITEM(pos);
 	GenericXLogState* xlogState = GenericXLogStart(rel);
 	UndamPosition next, undo = 0; /* Zero undo position means that we are proceessing head chunk */
-	UndamAllocChain* chains = UndamGetAllocChain(rel);
 
 	while (true)
 	{
@@ -393,23 +396,23 @@ UndamDeleteTuple(Relation rel, UndamPosition pos)
 		Buffer chainBuf = InvalidBuffer;
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 
-		Assert(pg->alloc_mask[item >> 6] & ((uint64)1 << (item & 63)));
-		pg->alloc_mask[item >> 6] &= ~((uint64)1 << (item & 63));
+		Assert(pg->allocMask[item >> 6] & ((uint64)1 << (item & 63)));
+		pg->allocMask[item >> 6] &= ~((uint64)1 << (item & 63));
 
 		if (undo) /* not first chunk */
 		{
-			UndamTupleChunk* chunk = (UndamTupleChunk*)((char*)pg + item*UndamChunkSize);
+			UndamTupleChunk* chunk = (UndamTupleChunk*)((char*)pg + item*CHUNK_SIZE);
 			next = chunk->next;
 		}
 		else
 		{
-			UndamTupleHeader* hdr = (UndamTupleHeader*)((char*)pg + item*UndamChunkSize);
+			UndamTupleHeader* hdr = (UndamTupleHeader*)((char*)pg + item*CHUNK_SIZE);
 			undo = hdr->undo_chain;
 			next = hdr->next_chunk;
 		}
 		if (pg->pd_flags & PD_PAGE_FULL) /* page was full: include it in allocation chain  */
 		{
-			int chainNo = blocknum % UndamNAllocChains;
+			int chainNo = blocknum % N_ALLOC_CHAINS;
 			UndamPageHeader* chain;
 
 			pg->pd_flags &= ~PD_PAGE_FULL;
@@ -419,7 +422,7 @@ UndamDeleteTuple(Relation rel, UndamPosition pos)
 				chainBuf = ReadBufferExtended(rel, EXT_FORKNUM, chainNo*BLCKSZ, RBM_NORMAL, NULL);
 				LockBuffer(chainBuf, BUFFER_LOCK_EXCLUSIVE);
 				chain = (UndamPageHeader*)GenericXLogRegisterBuffer(xlogState, chainBuf, 0);
-				Assert(chain->head == chains[chainNo].forks[EXT_FORKNUM].head);
+				Assert(chain->head == relinfo->chains[chainNo].forks[EXT_FORKNUM].head);
 			}
 			else
 			{
@@ -429,7 +432,7 @@ UndamDeleteTuple(Relation rel, UndamPosition pos)
 			/* Update chain header */
 			pg->next = chain->head;
 			chain->head = blocknum;
-			chains[chainNo].forks[EXT_FORKNUM].head = blocknum;
+			relinfo->chains[chainNo].forks[EXT_FORKNUM].head = blocknum;
 		}
 		GenericXLogFinish(xlogState);
 		if (chainBuf)
@@ -1392,8 +1395,8 @@ undam_beginscan(Relation relation, Snapshot snapshot,
     scan->base.rs_snapshot = snapshot;
     scan->base.rs_nkeys = nkeys;
     scan->base.rs_flags = flags;
-	scan->last_block = UndamGetLastBlock(relation, MAIN_FORKNUM);
-	ItemPointerSet(&scan->curr_item, 0, 1);
+	scan->lastBlock = UndamGetLastBlock(relation, MAIN_FORKNUM);
+	ItemPointerSet(&scan->currItem, 0, 1);
     return (TableScanDesc) scan;
 }
 
@@ -1402,16 +1405,17 @@ undam_getnextslot(TableScanDesc scan, ScanDirection direction, TupleTableSlot *s
 {
     UndamScanDesc uscan = (UndamScanDesc) scan;
     Relation      rel = scan->rs_rd;
+	UndamRelationInfo* relinfo = UndamGetRelationInfo(rel);
 	HeapTuple     tuple;
-	int           pos = ItemPointerGetOffsetNumber(&uscan->curr_item);
-	BlockNumber   blocknum = ItemPointerGetBlockNumber(&uscan->curr_item);
+	int           pos = ItemPointerGetOffsetNumber(&uscan->currItem);
+	BlockNumber   blocknum = ItemPointerGetBlockNumber(&uscan->currItem);
 	int           nChunks = CHUNKS_PER_BLOCK;
 
     /* TODO: handle direction */
     if (direction == BackwardScanDirection)
         elog(ERROR, "undam: backward scan is not implemented");
 
-	while (blocknum < uscan->last_block)
+	while (blocknum < uscan->lastBlock)
 	{
 		Buffer buf = ReadBufferExtended(rel, MAIN_FORKNUM, blocknum, RBM_ZERO_ON_ERROR, NULL); /* there may be empty pages because of difference in length of allocation chains */
 		UndamPageHeader* pg = (UndamPageHeader*)BufferGetPage(buf);
@@ -1419,10 +1423,10 @@ undam_getnextslot(TableScanDesc scan, ScanDirection direction, TupleTableSlot *s
 
 		while (pos < nChunks)
 		{
-			if (pg->alloc_mask[pos >> 6] & ((uint64)1 << (pos & 63)))
+			if (pg->allocMask[pos >> 6] & ((uint64)1 << (pos & 63)))
 			{
-				ItemPointerSet(&uscan->curr_item, blocknum, pos);
-				tuple = UndamReadTuple(scan->rs_rd, scan->rs_snapshot, &uscan->curr_item);
+				ItemPointerSet(&uscan->currItem, blocknum, pos);
+				tuple = UndamReadTuple(scan->rs_rd, scan->rs_snapshot, &uscan->currItem);
 				if (tuple != NULL)
 				{
 					ExecStoreHeapTuple(tuple, slot, true);
@@ -1444,7 +1448,7 @@ undam_rescan(TableScanDesc scan, ScanKey key, bool set_params,
             bool allow_strat, bool allow_sync, bool allow_pagemode)
 {
     UndamScanDesc uscan = (UndamScanDesc) scan;
-	ItemPointerSet(&uscan->curr_item, 0, 1);
+	ItemPointerSet(&uscan->currItem, 0, 1);
 }
 
 static void
@@ -1504,7 +1508,7 @@ undam_scan_bitmap_next_block(TableScanDesc scan,
                             struct TBMIterateResult *tbmres)
 {
     UndamScanDesc uscan = (UndamScanDesc) scan;
-	return tbmres->blockno < uscan->last_block;
+	return tbmres->blockno < uscan->lastBlock;
 }
 
 static bool
@@ -1514,8 +1518,9 @@ undam_scan_bitmap_next_tuple(TableScanDesc scan,
 {
     UndamScanDesc uscan = (UndamScanDesc) scan;
     Relation      rel = scan->rs_rd;
+	UndamRelationInfo* relinfo = UndamGetRelationInfo(rel);
 	HeapTuple     tuple;
-	int           offs = ItemPointerGetOffsetNumber(&uscan->curr_item);
+	int           offs = ItemPointerGetOffsetNumber(&uscan->currItem);
 	BlockNumber   blocknum = tbmres->blockno;
 	int           nChunks = CHUNKS_PER_BLOCK;
 	Buffer buf = ReadBufferExtended(rel, MAIN_FORKNUM, blocknum, RBM_NORMAL, NULL);
@@ -1542,10 +1547,10 @@ undam_scan_bitmap_next_tuple(TableScanDesc scan,
 			pos = offs;
 		}
 		offs += 1;
-		if (pg->alloc_mask[pos >> 6] & ((uint64)1 << (pos & 63)))
+		if (pg->allocMask[pos >> 6] & ((uint64)1 << (pos & 63)))
 		{
-			ItemPointerSet(&uscan->curr_item, blocknum, pos);
-			tuple = UndamReadTuple(scan->rs_rd, scan->rs_snapshot, &uscan->curr_item);
+			ItemPointerSet(&uscan->currItem, blocknum, pos);
+			tuple = UndamReadTuple(scan->rs_rd, scan->rs_snapshot, &uscan->currItem);
 			if (tuple != NULL)
 			{
 				found = true;
@@ -1555,7 +1560,7 @@ undam_scan_bitmap_next_tuple(TableScanDesc scan,
 		}
 	}
 	UnlockReleaseBuffer(buf);
-	ItemPointerSetOffsetNumber(&uscan->curr_item, offs);
+	ItemPointerSetOffsetNumber(&uscan->currItem, offs);
 	return found;
 }
 
@@ -1578,14 +1583,14 @@ static bool
 undam_tuple_tid_valid(TableScanDesc scan, ItemPointer tid)
 {
 	UndamScanDesc uscan = (UndamScanDesc)scan;
-	int           pos = ItemPointerGetOffsetNumber(&uscan->curr_item);
-	BlockNumber   blocknum = ItemPointerGetBlockNumber(&uscan->curr_item);
+	int           pos = ItemPointerGetOffsetNumber(&uscan->currItem);
+	BlockNumber   blocknum = ItemPointerGetBlockNumber(&uscan->currItem);
 	Buffer buf = ReadBufferExtended(scan->rs_rd, MAIN_FORKNUM, blocknum, RBM_NORMAL, NULL);
 	UndamPageHeader* pg = (UndamPageHeader*)BufferGetPage(buf);
 	bool is_valid;
 
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	is_valid = (pg->alloc_mask[pos >> 6] >> (pos & 63)) & 1;
+	is_valid = (pg->allocMask[pos >> 6] >> (pos & 63)) & 1;
 	UnlockReleaseBuffer(buf);
 
 	return is_valid;
@@ -1663,6 +1668,7 @@ undam_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
 				   bool wait, TM_FailureData *tmfd,
 				   LockTupleMode *lockmode, bool *update_indexes)
 {
+	UndamRelationInfo* relinfo = UndamGetRelationInfo(relation);
 	TransactionId xid = GetCurrentTransactionId();
 	Bitmapset  *key_attrs;
 	Bitmapset  *modified_attrs;
@@ -1733,7 +1739,7 @@ undam_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
 	page = BufferGetPage(buffer);
 	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 	oldtup.t_tableOid = RelationGetRelid(relation);
-	oldtup.t_data = (HeapTupleHeader)((char*)page + ItemPointerGetOffsetNumber(otid)*UndamChunkSize);
+	oldtup.t_data = (HeapTupleHeader)((char*)page + ItemPointerGetOffsetNumber(otid)*CHUNK_SIZE);
 	oldtup.t_len = HeapTupleHeaderGetDatumLength(oldtup.t_data);
 	oldtup.t_self = *otid;
 
@@ -2125,6 +2131,7 @@ undam_relation_estimate_size(Relation rel, int32 *attr_widths,
 							 double *allvisfrac)
 {
 	BlockNumber forks[2];
+	UndamRelationInfo* relinfo = UndamGetRelationInfo(rel);
 	for (int fork = MAIN_FORKNUM; fork <= EXT_FORKNUM; fork++)
 		forks[fork] = UndamGetLastBlock(rel, fork);
 	*pages = forks[MAIN_FORKNUM] + forks[EXT_FORKNUM];
@@ -2135,9 +2142,10 @@ undam_relation_estimate_size(Relation rel, int32 *attr_widths,
 static bool
 UndamBitmapCheck(ItemPointer itemptr, void *state)
 {
+	UndamVacuumContext* ctx  = (UndamVacuumContext*)state;
+	UndamRelationInfo* relinfo = ctx->relinfo;
 	UndamPosition pos = POSITION_FROM_ITEMPOINTER(itemptr);
-	uint64* dead_bitmap = (uint64*)state;
-	return (dead_bitmap[pos >> 6] >> (pos & 63)) & 1;
+	return (ctx->deadBitmap[pos >> 6] >> (pos & 63)) & 1;
 }
 
 static void
@@ -2147,6 +2155,10 @@ UndamVacuumIndexes(Relation rel, uint64* deadBitmap, uint64 reltuples, BufferAcc
 	int			nindexes;
 	IndexVacuumInfo ivinfo;
 	IndexBulkDeleteResult **stats;
+	UndamVacuumContext ctx;
+
+	ctx.deadBitmap = deadBitmap;
+	ctx.relinfo = UndamGetRelationInfo(rel);
 
 	/* Open all indexes of the relation */
 	vac_open_indexes(rel, RowExclusiveLock, &nindexes, &Irel);
@@ -2162,7 +2174,7 @@ UndamVacuumIndexes(Relation rel, uint64* deadBitmap, uint64 reltuples, BufferAcc
 	for (int idx = 0; idx < nindexes; idx++)
 	{
 		ivinfo.index = Irel[idx];
-		stats[idx] = index_bulk_delete(&ivinfo, stats[idx], UndamBitmapCheck, (void*)deadBitmap);
+		stats[idx] = index_bulk_delete(&ivinfo, stats[idx], UndamBitmapCheck, (void*)&ctx);
 	}
 	/* TODO: do something with index stats */
 
@@ -2175,6 +2187,7 @@ undam_relation_vacuum(Relation rel,
 					  struct VacuumParams *params,
 					  BufferAccessStrategy bstrategy)
 {
+	UndamRelationInfo* relinfo = UndamGetRelationInfo(rel);
 	BlockNumber lastBlock = UndamGetLastBlock(rel, MAIN_FORKNUM);
 	int nChunks = CHUNKS_PER_BLOCK;
 	HeapTupleData tuple;
@@ -2209,9 +2222,9 @@ undam_relation_vacuum(Relation rel,
 
 		for (int chunk = 1; chunk < nChunks; chunk++)
 		{
-			if (pg->alloc_mask[chunk >> 6] & ((uint64)1 << (chunk & 63)))
+			if (pg->allocMask[chunk >> 6] & ((uint64)1 << (chunk & 63)))
 			{
-				UndamTupleHeader* tup = (UndamTupleHeader*)((char*)pg + chunk*UndamChunkSize);
+				UndamTupleHeader* tup = (UndamTupleHeader*)((char*)pg + chunk*CHUNK_SIZE);
 				if (!HeapTupleHeaderXminFrozen(&tup->hdr))
 				{
 					TransactionId xmin = HeapTupleHeaderGetRawXmin(&tup->hdr);
@@ -2231,7 +2244,7 @@ undam_relation_vacuum(Relation rel,
 						if (HeapTupleSatisfiesVacuum(&tuple, oldestXmin, buf) == HEAPTUPLE_DEAD)
 						{
 							UndamPosition pos = GET_POSITION(block, chunk);
-							pg->alloc_mask[chunk >> 6] &= ~((uint64)1 << (chunk & 63));
+							pg->allocMask[chunk >> 6] &= ~((uint64)1 << (chunk & 63));
 							deadBitmap[pos >> 6] |= (uint64)1 << (pos & 63);
 							nDeleted += 1;
 							if (tup->next_chunk != INVALID_POSITION)
@@ -2287,10 +2300,9 @@ undam_relation_vacuum(Relation rel,
 		}
 		if (nDeleted != 0 && (pg->pd_flags & PD_PAGE_FULL))  /* page was full: include it in allocation chain  */
 		{
-			int chainNo = block % UndamNAllocChains;
+			int chainNo = block % N_ALLOC_CHAINS;
 			Buffer chainBuf;
 			UndamPageHeader* chain;
-			UndamAllocChain* chains = UndamGetAllocChain(rel);
 
 			Assert(xlogState != NULL);
 			pg->pd_flags &= ~PD_PAGE_FULL;
@@ -2300,7 +2312,7 @@ undam_relation_vacuum(Relation rel,
 				chainBuf = ReadBufferExtended(rel, MAIN_FORKNUM, chainNo*BLCKSZ, RBM_NORMAL, NULL);
 				LockBuffer(chainBuf, BUFFER_LOCK_EXCLUSIVE);
 				chain = (UndamPageHeader*)GenericXLogRegisterBuffer(xlogState, chainBuf, 0);
-				Assert(chain->head == chains[chainNo].forks[MAIN_FORKNUM].head);
+				Assert(chain->head == relinfo->chains[chainNo].forks[MAIN_FORKNUM].head);
 			}
 			else
 			{
@@ -2310,7 +2322,7 @@ undam_relation_vacuum(Relation rel,
 			/* Update chain header */
 			pg->next = chain->head;
 			chain->head = block;
-			chains[chainNo].forks[MAIN_FORKNUM].head = block;
+			relinfo->chains[chainNo].forks[MAIN_FORKNUM].head = block;
 		}
 		if (xlogState)
 			GenericXLogFinish(xlogState);
@@ -2331,6 +2343,7 @@ undam_tuple_delete(Relation relation, ItemPointer tid, CommandId cid,
 				   TM_FailureData *tmfd, bool changingPart)
 {
 	TM_Result	result;
+	UndamRelationInfo* relinfo = UndamGetRelationInfo(relation);
 	TransactionId xid = GetCurrentTransactionId();
 	UndamTupleHeader* tup;
 	HeapTupleData tp;
@@ -2362,7 +2375,7 @@ undam_tuple_delete(Relation relation, ItemPointer tid, CommandId cid,
 
 	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 
-	tup = (UndamTupleHeader*)((char*)page + ItemPointerGetOffsetNumber(tid)*UndamChunkSize);
+	tup = (UndamTupleHeader*)((char*)page + ItemPointerGetOffsetNumber(tid)*CHUNK_SIZE);
 
 	tp.t_tableOid = RelationGetRelid(relation);
 	tp.t_data = &tup->hdr;
@@ -2526,7 +2539,7 @@ l1:
 
 	xlogState = GenericXLogStart(relation);
 	page = GenericXLogRegisterBuffer(xlogState, buffer, 0);
-	tup = (UndamTupleHeader*)((char*)page + ItemPointerGetOffsetNumber(tid)*UndamChunkSize);
+	tup = (UndamTupleHeader*)((char*)page + ItemPointerGetOffsetNumber(tid)*CHUNK_SIZE);
 	tp.t_data = &tup->hdr;
 
 	/* replace cid with a combo cid if necessary */
@@ -2615,7 +2628,7 @@ undam_relation_nontransactional_truncate(Relation rel)
 	/*
 	 * Remove entry from hash to force reinitialization of root pages.
 	 */
-	hash_search(UndamAllocChainsHash, &RelationGetRelid(rel), HASH_REMOVE, NULL);
+	hash_search(UndamRelInfoHash, &RelationGetRelid(rel), HASH_REMOVE, NULL);
 }
 
 static void
@@ -2695,10 +2708,10 @@ undam_scan_analyze_next_block(TableScanDesc scan, BlockNumber blockno,
 {
     UndamScanDesc   uscan = (UndamScanDesc) scan;
 
-	if (blockno >= uscan->last_block)
+	if (blockno >= uscan->lastBlock)
 		return false;
 
-	ItemPointerSet(&uscan->curr_item, blockno, 1);
+	ItemPointerSet(&uscan->currItem, blockno, 1);
     return true;
 }
 
@@ -2707,10 +2720,11 @@ undam_scan_analyze_next_tuple(TableScanDesc scan, TransactionId OldestXmin,
 							  double *liverows, double *deadrows,
 							  TupleTableSlot *slot)
 {
-    UndamScanDesc uscan = (UndamScanDesc) scan;
     Relation      rel = scan->rs_rd;
-	int           item = ItemPointerGetOffsetNumber(&uscan->curr_item);
-	BlockNumber   blocknum = ItemPointerGetBlockNumber(&uscan->curr_item);
+	UndamRelationInfo* relinfo = UndamGetRelationInfo(rel);
+    UndamScanDesc uscan = (UndamScanDesc) scan;
+	int           item = ItemPointerGetOffsetNumber(&uscan->currItem);
+	BlockNumber   blocknum = ItemPointerGetBlockNumber(&uscan->currItem);
 	int           nChunks = CHUNKS_PER_BLOCK;
 	Buffer        buf = ReadBufferExtended(rel, MAIN_FORKNUM, blocknum, RBM_ZERO_ON_ERROR, NULL);
 	UndamPageHeader* pg = (UndamPageHeader*)BufferGetPage(buf);
@@ -2719,9 +2733,9 @@ undam_scan_analyze_next_tuple(TableScanDesc scan, TransactionId OldestXmin,
 
 	while (item < nChunks)
 	{
-		if (pg->alloc_mask[item >> 6] & ((uint64)1 << (item & 63)))
+		if (pg->allocMask[item >> 6] & ((uint64)1 << (item & 63)))
 		{
-			UndamTupleHeader* tup = (UndamTupleHeader*)((char*)pg + item*UndamChunkSize);
+			UndamTupleHeader* tup = (UndamTupleHeader*)((char*)pg + item*CHUNK_SIZE);
 			HeapTupleData tuphdr;
 			int len = HeapTupleHeaderGetDatumLength(&tup->hdr);
 			bool sample_it = false;
@@ -2811,7 +2825,7 @@ undam_scan_analyze_next_tuple(TableScanDesc scan, TransactionId OldestXmin,
 			if (sample_it)
 			{
 				HeapTuple tuple = (HeapTuple)palloc(sizeof(HeapTupleData) + len);
-				int available = UndamChunkSize - offsetof(UndamTupleHeader, hdr);
+				int available = CHUNK_SIZE - offsetof(UndamTupleHeader, hdr);
 
 				*tuple = tuphdr;
 				tuple->t_data = (HeapTupleHeader)(tuple + 1); /* store tuple bosy just after the header */
@@ -2828,7 +2842,7 @@ undam_scan_analyze_next_tuple(TableScanDesc scan, TransactionId OldestXmin,
 					memcpy(dst, &tup->hdr, available);
 					dst += available;
 					len -= available;
-					available =  UndamChunkSize - offsetof(UndamTupleChunk, data); /* head chunk contains less data */
+					available =  CHUNK_SIZE - offsetof(UndamTupleChunk, data); /* head chunk contains less data */
 
 					do {
 						UnlockReleaseBuffer(buf);
@@ -3119,19 +3133,18 @@ void _PG_init(void)
 	if (!process_shared_preload_libraries_in_progress)
 		return;
 
-#ifdef TABLEAM_OPTOINS_SUPPORTED
 	UndamReloptKind = add_reloption_kind();
-	add_int_reloption(UndamReloptKind, "chunk", "Size of allocation chunk", 64, 64, BLCKSZ/8, AccessExclusiveLock);
-	add_int_reloption(UndamReloptKind, "chains", "Number of allocation chains", 8, 1,128, AccessExclusiveLock);
-#else
+	add_int_reloption(UndamReloptKind, "chunk", "Size of allocation chunk", 64, 64, MAX_CHUNCK_SIZE, AccessExclusiveLock);
+	add_int_reloption(UndamReloptKind, "chains", "Number of allocation chains", 8, 1, MAX_ALLOC_CHAINS, AccessExclusiveLock);
+
        DefineCustomIntVariable("undam.chunk_size",
-                            "Size of allocation chaunk.",
+							   "Size of allocation chunk.",
                                                        NULL,
                                                        &UndamChunkSize,
                                                        64,
                                                        64,
-                                                       BLCKSZ/8,
-                                                       PGC_POSTMASTER,
+                                                       MAX_CHUNCK_SIZE,
+                                                       PGC_USERSET,
                                                        0,
                                                        NULL,
                                                        NULL,
@@ -3142,13 +3155,12 @@ void _PG_init(void)
                                                        &UndamNAllocChains,
                                                        8,
                                                        1,
-                                                       128,
-                                                       PGC_POSTMASTER,
+                                                       MAX_ALLOC_CHAINS,
+                                                       PGC_USERSET,
                                                        0,
                                                        NULL,
                                                        NULL,
                                                        NULL);
-#endif
 
 	DefineCustomIntVariable("undam.max_relations",
                             "Maximal number of relations.",
@@ -3162,27 +3174,8 @@ void _PG_init(void)
 							NULL,
 							NULL,
 							NULL);
-	RequestAddinShmemSpace(hash_estimate_size(UndamMaxRelations, sizeof(Oid) + sizeof(UndamAllocChain)*UndamNAllocChains));
+
+	RequestAddinShmemSpace(hash_estimate_size(UndamMaxRelations, sizeof(UndamRelationInfo)));
 	prev_shmem_startup_hook = shmem_startup_hook;
 	shmem_startup_hook = UndamShmemStartup;
 }
-
-#ifdef TABLEAM_OPTOINS_SUPPORTED
-/*
- * Parse reloptions for Undam table, producing a UndamOptions struct.
- */
-bytea *
-undamoptions(Datum reloptions, bool validate)
-{
-	UndamOptions *rdopts;
-
-	/* Parse the user-given reloptions */
-	rdopts = (UndamOptions *) build_reloptions(reloptions, validate,
-											   UndamReloptKind,
-											   sizeof(UndamOptions),
-											   UndamReloptTab,
-											   lengthof(UndamReloptTab));
-
-	return (bytea *) rdopts;
-}
-#endif

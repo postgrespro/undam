@@ -2,13 +2,17 @@
 #define __UNDAM_H__
 
 #define EXT_FORKNUM 1
+#define MAX_ALLOC_CHAINS 64
+#define MAX_CHUNCK_SIZE  (BLCKSZ/8)
 
 typedef uint64_t UndamPosition;
 
-#define CHUNKS_PER_BLOCK               (BLCKSZ/UndamChunkSize)
+#define CHUNKS_PER_BLOCK               (BLCKSZ/relinfo->chunkSize)
+#define CHUNK_SIZE                     (relinfo->chunkSize)
+#define N_ALLOC_CHAINS                 (relinfo->nChains)
 #define POSITION_GET_BLOCK_NUMBER(pos) ((BlockNumber)((pos)/CHUNKS_PER_BLOCK))
 #define POSITION_GET_ITEM(pos)         ((uint32)((pos) % CHUNKS_PER_BLOCK))
-#define POSITION_GET_BLOCK_OFFSET(pos) (POSITION_GET_ITEM(pos)*UndamChunkSize)
+#define POSITION_GET_BLOCK_OFFSET(pos) (POSITION_GET_ITEM(pos)*relinfo->chunkSize)
 #define GET_POSITION(blocknum,item)    ((UndamPosition)(blocknum)*CHUNKS_PER_BLOCK + (item))
 #define POSITION_FROM_ITEMPOINTER(ip)  GET_POSITION(BlockIdGetBlockNumber(&(ip)->ip_blkid), (ip)->ip_posid)
 #define INVALID_POSITION               GET_POSITION(InvalidBlockNumber, 0)
@@ -16,8 +20,8 @@ typedef uint64_t UndamPosition;
 typedef struct
 {
 	int32		vl_len_;	 /* varlena header (do not touch directly!) */
-	int			chunkSize;	 /* chunk size */
-	int         allocChains; /* number of allocation chains */
+	uint32		chunkSize;	 /* chunk size */
+	uint32      allocChains; /* number of allocation chains */
 } UndamOptions;
 
 typedef struct
@@ -61,24 +65,33 @@ typedef struct
 	BlockNumber    next; /* pointer to next page in L1 list of not-full pages */
 	BlockNumber    head; /* head of L1 list of not-full pages */
 	BlockNumber    tail; /* last free page */
-	uint16         chunk_size; /* size of chunk: used to verify data format */
-	uint16         n_chains; /* number of allocation chains: used to verify data format */
-	uint64         alloc_mask[FLEXIBLE_ARRAY_MEMBER];
+	uint16         chunkSize; /* size of chunk: used to verify data format */
+	uint16         nChains; /* number of allocation chains: used to verify data format */
+	uint64         allocMask[FLEXIBLE_ARRAY_MEMBER];
 } UndamPageHeader;
 
 typedef struct
 {
 	Oid reloid;
-	UndamAllocChain chains[FLEXIBLE_ARRAY_MEMBER];
-} UndamAllocHashEntry;
+	uint32 chunkSize;
+	uint32 nChains;
+	UndamAllocChain chains[MAX_ALLOC_CHAINS];
+} UndamRelationInfo;
 
 
 typedef struct
 {
     TableScanDescData   base;
-	BlockNumber         last_block;
-    ItemPointerData     curr_item;
+	BlockNumber         lastBlock;
+    ItemPointerData     currItem;
 } UndamScanDescData;
 typedef UndamScanDescData* UndamScanDesc;
+
+typedef struct
+{
+	UndamRelationInfo* relinfo;
+	uint64*            deadBitmap;
+} UndamVacuumContext;
+
 
 #endif
