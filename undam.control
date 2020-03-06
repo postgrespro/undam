@@ -1,0 +1,4 @@
+comment = 'Undo storage'
+default_version = '0.1'
+module_pathname = '$libdir/undam'
+relocatable = true

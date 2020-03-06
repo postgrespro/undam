@@ -1,0 +1,6 @@
+CREATE FUNCTION undam_tableam_handler(INTERNAL) RETURNS table_am_handler
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE ACCESS METHOD undam
+TYPE TABLE
+HANDLER undam_tableam_handler;
