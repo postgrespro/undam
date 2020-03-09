@@ -3,7 +3,8 @@
 
 #define EXT_FORKNUM 1
 #define MAX_ALLOC_CHAINS 64
-#define MAX_CHUNCK_SIZE  (BLCKSZ/8)
+#define MIN_CHUNK_SIZE   64
+#define MAX_CHUNK_SIZE   (BLCKSZ/8)
 
 typedef uint64_t UndamPosition;
 
@@ -12,7 +13,7 @@ typedef uint64_t UndamPosition;
 #define N_ALLOC_CHAINS                 (relinfo->nChains)
 #define POSITION_GET_BLOCK_NUMBER(pos) ((BlockNumber)((pos)/CHUNKS_PER_BLOCK))
 #define POSITION_GET_ITEM(pos)         ((uint32)((pos) % CHUNKS_PER_BLOCK))
-#define POSITION_GET_BLOCK_OFFSET(pos) (POSITION_GET_ITEM(pos)*relinfo->chunkSize)
+#define POSITION_GET_BLOCK_OFFSET(pos) (POSITION_GET_ITEM(pos)*CHUNK_SIZE)
 #define GET_POSITION(blocknum,item)    ((UndamPosition)(blocknum)*CHUNKS_PER_BLOCK + (item))
 #define POSITION_FROM_ITEMPOINTER(ip)  GET_POSITION(BlockIdGetBlockNumber(&(ip)->ip_blkid), (ip)->ip_posid)
 #define INVALID_POSITION               GET_POSITION(InvalidBlockNumber, 0)
@@ -26,8 +27,8 @@ typedef struct
 
 typedef struct
 {
-	BlockNumber head;
-	BlockNumber tail;
+	BlockNumber head; /* head of L1 list of not-full pages */
+	BlockNumber tail; /* first unused page */
 } UndamAllocList;
 
 typedef struct
@@ -37,8 +38,8 @@ typedef struct
 
 typedef struct
 {
-	UndamPosition next_chunk;
-	UndamPosition undo_chain;
+	UndamPosition nextChunk;
+	UndamPosition undoChain;
 	HeapTupleHeaderData hdr;
 } UndamTupleHeader;
 
