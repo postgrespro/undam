@@ -24,6 +24,12 @@ heap (based on tuple's XMIN/XMAX and snapshots).
 
 Undam storage also requires vacuum which freeze old tuples and truncated unneeded undo chains.
 
+Undam use fixed size allocator for relation chunks.
+Head of the listis stored in one of root pages of relations.
+To prevent this root page from becoming battelenck we use several lists (undam.alloc_chains),
+header of each is stored in its own root page. List is choosed randomely.
+List with index K is used for allocation of pages which (blockno % undam.alloc_chains) == K.
+
 Undam storage is using generic WAL messages to provide ACID transaction behavior.
 As far as it never shift data on the page, generic WAL messages delta calculation mechanism
 is quite efficient in this case.

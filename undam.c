@@ -102,7 +102,7 @@ UndamGetRelationInfo(Relation rel)
 				}
 				else
 				{
-					if (relinfo->chunkSize != pg->chunkSize || relinfo->nChains != nAllocChains = pg->nChains)
+					if (relinfo->chunkSize != pg->chunkSize || relinfo->nChains != pg->nChains)
 						elog(ERROR, "UNDAM: corrupted metapage");
 				}
 				UnlockReleaseBuffer(buf);
@@ -399,9 +399,9 @@ UndamDeleteTuple(Relation rel, UndamPosition pos)
 	while (true)
 	{
 		Buffer buf = ReadBufferExtended(rel, EXT_FORKNUM, blocknum, RBM_NORMAL, NULL);
+		GenericXLogState* xlogState = GenericXLogStart(rel);
 		UndamPageHeader* pg = (UndamPageHeader*)GenericXLogRegisterBuffer(xlogState, buf, 0);
 		Buffer chainBuf = InvalidBuffer;
-		GenericXLogState* xlogState = GenericXLogStart(rel);
 
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 
@@ -1381,7 +1381,7 @@ UpdateXmaxHintBits(HeapTupleHeader tuple, Buffer buffer, TransactionId xid)
 static const TupleTableSlotOps *
 undam_slot_callbacks(Relation relation)
 {
-    return &TTSOpsHeapTuple;
+    return &TTSOpsHeapTuple; /* we do not what to pin buffers so we create heap-only tuple */
 }
 
 
@@ -1404,7 +1404,7 @@ undam_beginscan(Relation relation, Snapshot snapshot,
     scan->base.rs_nkeys = nkeys;
     scan->base.rs_flags = flags;
 	scan->lastBlock = UndamGetLastBlock(relation, MAIN_FORKNUM);
-	ItemPointerSet(&scan->currItem, 0, 1);
+	ItemPointerSet(&scan->currItem, 0, 0); /* chunk poistion will be incremented by getnextslot, so start with zero item */
     return (TableScanDesc) scan;
 }
 
@@ -1415,7 +1415,7 @@ undam_getnextslot(TableScanDesc scan, ScanDirection direction, TupleTableSlot *s
     Relation      rel = scan->rs_rd;
 	UndamRelationInfo* relinfo = UndamGetRelationInfo(rel);
 	HeapTuple     tuple;
-	int           pos = ItemPointerGetOffsetNumber(&uscan->currItem);
+	int           item = ItemPointerGetOffsetNumber(&uscan->currItem) + 1; /* next item to try */
 	BlockNumber   blocknum = ItemPointerGetBlockNumber(&uscan->currItem);
 	int           nChunks = CHUNKS_PER_BLOCK;
 
@@ -1425,28 +1425,30 @@ undam_getnextslot(TableScanDesc scan, ScanDirection direction, TupleTableSlot *s
 
 	while (blocknum < uscan->lastBlock)
 	{
-		Buffer buf = ReadBufferExtended(rel, MAIN_FORKNUM, blocknum, RBM_ZERO_ON_ERROR, NULL); /* there may be empty pages because of difference in length of allocation chains */
+		Buffer buf = ReadBufferExtended(rel, MAIN_FORKNUM, blocknum, RBM_ZERO_ON_ERROR, NULL);
+        /* Use RBM_ZERO_ON_ERROR because there are can be empty pages caused by difference in length of allocation chains */
 		UndamPageHeader* pg = (UndamPageHeader*)BufferGetPage(buf);
+
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 
-		while (pos < nChunks)
+		while (item < nChunks)
 		{
-			if (pg->allocMask[pos >> 6] & ((uint64)1 << (pos & 63)))
+			if (pg->allocMask[item >> 6] & ((uint64)1 << (item & 63))) /* chunk is allocated */
 			{
-				ItemPointerSet(&uscan->currItem, blocknum, pos);
+				ItemPointerSet(&uscan->currItem, blocknum, item);
 				tuple = UndamReadTuple(scan->rs_rd, scan->rs_snapshot, &uscan->currItem);
-				if (tuple != NULL)
+				if (tuple != NULL) /* Found some visible version */
 				{
 					ExecStoreHeapTuple(tuple, slot, true);
 					UnlockReleaseBuffer(buf);
 					return true;
 				}
 			}
-			pos += 1;
+			item += 1;
 		}
 		UnlockReleaseBuffer(buf);
 		blocknum += 1;
-		pos = 1;
+		item = 1; /* first chunk is used for page header, so skip it */
 	}
 	return false;
 }
@@ -1456,7 +1458,7 @@ undam_rescan(TableScanDesc scan, ScanKey key, bool set_params,
             bool allow_strat, bool allow_sync, bool allow_pagemode)
 {
     UndamScanDesc uscan = (UndamScanDesc) scan;
-	ItemPointerSet(&uscan->currItem, 0, 1);
+	ItemPointerSet(&uscan->currItem, 0, 0); /* restart from the beginning */
 }
 
 static void
@@ -1503,7 +1505,7 @@ undam_index_fetch_tuple(struct IndexFetchTableData *scan,
 						bool *call_again, bool *all_dead)
 {
 	HeapTuple tuple = UndamReadTuple(scan->rel, snapshot, tid);
-	if (tuple != NULL)
+	if (tuple != NULL) /* found some visible version */
 	{
 		ExecStoreHeapTuple(tuple, slot, true);
 		return true;
@@ -1516,6 +1518,7 @@ undam_scan_bitmap_next_block(TableScanDesc scan,
                             struct TBMIterateResult *tbmres)
 {
     UndamScanDesc uscan = (UndamScanDesc) scan;
+	ItemPointerSet(&uscan->currItem, tbmres->blockno, 0);
 	return tbmres->blockno < uscan->lastBlock;
 }
 
@@ -1539,27 +1542,28 @@ undam_scan_bitmap_next_tuple(TableScanDesc scan,
 
 	while (true)
 	{
-		int pos;
+		int item;
 		if (tbmres->ntuples >= 0)
 		{
 			/* for non-lossy scan offs points to the position in tbmres->offsets. */
 			if (offs >= tbmres->ntuples)
 				break;
-			pos = tbmres->offsets[offs];
+			item = tbmres->offsets[offs];
+			Assert(item > 0 && item < nChunks);
 		}
 		else /* lossy scan */
 		{
 			/* for lossy scan we interpret offs as a position in the block */
- 			if (offs > nChunks)
+			item = offs + 1; /* we need to skip first chunk used for page header */
+ 			if (item > nChunks)
 				break;
-			pos = offs;
 		}
-		offs += 1;
-		if (pg->allocMask[pos >> 6] & ((uint64)1 << (pos & 63)))
+		offs += 1; /* advance offset: we will store it in currItem on loop exit */
+		if (pg->allocMask[item >> 6] & ((uint64)1 << (item & 63))) /* chunk is allocated */
 		{
-			ItemPointerSet(&uscan->currItem, blocknum, pos);
+			ItemPointerSetOffsetNumber(&uscan->currItem, item);
 			tuple = UndamReadTuple(scan->rs_rd, scan->rs_snapshot, &uscan->currItem);
-			if (tuple != NULL)
+			if (tuple != NULL) /* found some visible tuple */
 			{
 				found = true;
 				ExecStoreHeapTuple(tuple, slot, true);
@@ -1568,7 +1572,7 @@ undam_scan_bitmap_next_tuple(TableScanDesc scan,
 		}
 	}
 	UnlockReleaseBuffer(buf);
-	ItemPointerSetOffsetNumber(&uscan->currItem, offs);
+	ItemPointerSetOffsetNumber(&uscan->currItem, offs); /* save updated offset for next call of undam_scan_bitmap_next_tuple */
 	return found;
 }
 
@@ -1579,7 +1583,7 @@ undam_fetch_row_version(Relation relation,
 						TupleTableSlot *slot)
 {
 	HeapTuple tuple = UndamReadTuple(relation, snapshot, tid);
-	if (tuple != NULL)
+	if (tuple != NULL) /* found some visible tuple */
 	{
 		ExecStoreHeapTuple(tuple, slot, true);
 		return true;
@@ -1591,14 +1595,17 @@ static bool
 undam_tuple_tid_valid(TableScanDesc scan, ItemPointer tid)
 {
 	UndamScanDesc uscan = (UndamScanDesc)scan;
-	int           pos = ItemPointerGetOffsetNumber(&uscan->currItem);
+	UndamRelationInfo* relinfo = UndamGetRelationInfo(scan->rs_rd);
+	int item = ItemPointerGetOffsetNumber(&uscan->currItem);
 	BlockNumber   blocknum = ItemPointerGetBlockNumber(&uscan->currItem);
 	Buffer buf = ReadBufferExtended(scan->rs_rd, MAIN_FORKNUM, blocknum, RBM_NORMAL, NULL);
 	UndamPageHeader* pg = (UndamPageHeader*)BufferGetPage(buf);
 	bool is_valid;
 
+	Assert(item > 0 && item < CHUNKS_PER_BLOCK);
+
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	is_valid = (pg->allocMask[pos >> 6] >> (pos & 63)) & 1;
+	is_valid = (pg->allocMask[item >> 6] >> (item & 63)) & 1; /* we only check that buffer was allocated */
 	UnlockReleaseBuffer(buf);
 
 	return is_valid;
@@ -2093,7 +2100,7 @@ l2:
 	HeapTupleHeaderSetCmax(oldtup.t_data, cid, iscombo);
 
 	newtup->t_self = *otid;
-	UndamUpdateTuple(relation, newtup, buffer);
+	UndamUpdateTuple(relation, newtup, buffer); /* will release buffer lock */
 
 	/*
 	 * Release the lmgr tuple lock, if we had it.
@@ -2147,15 +2154,21 @@ undam_relation_estimate_size(Relation rel, int32 *attr_widths,
 	*allvisfrac = 0;
 }
 
+/*
+ * Check if item is marked as dead by vacuum
+ */
 static bool
 UndamBitmapCheck(ItemPointer itemptr, void *state)
 {
 	UndamVacuumContext* ctx  = (UndamVacuumContext*)state;
 	UndamRelationInfo* relinfo = ctx->relinfo;
-	UndamPosition pos = POSITION_FROM_ITEMPOINTER(itemptr);
-	return (ctx->deadBitmap[pos >> 6] >> (pos & 63)) & 1;
+	UndamPosition item = POSITION_FROM_ITEMPOINTER(itemptr);
+	return (ctx->deadBitmap[item >> 6] >> (item & 63)) & 1;
 }
 
+/*
+ * Vacuum all indexes associated with this relation
+ */
 static void
 UndamVacuumIndexes(Relation rel, uint64* deadBitmap, uint64 reltuples, BufferAccessStrategy bstrategy)
 {
@@ -2200,7 +2213,7 @@ undam_relation_vacuum(Relation rel,
 	int nChunks = CHUNKS_PER_BLOCK;
 	HeapTupleData tuple;
 	uint64 nTuples  = (uint64)lastBlock*nChunks;
-	uint64* deadBitmap = (uint64*)calloc(nTuples/64, 8);
+	uint64* deadBitmap = (uint64*)calloc((nTuples+63)/64, 8); /* bitmap can be larger than 1Gb, so use calloc */
 	TransactionId oldestXmin;
 	TransactionId freezeLimit;
 	MultiXactId   multiXactCutoff;
@@ -2220,7 +2233,7 @@ undam_relation_vacuum(Relation rel,
 
 	for (BlockNumber block = 0; block < lastBlock; block++)
 	{
-		Buffer buf = ReadBufferExtended(rel, MAIN_FORKNUM, block, RBM_NORMAL, NULL);
+		Buffer buf = ReadBufferExtended(rel, MAIN_FORKNUM, block, RBM_ZERO_ON_ERROR, NULL);
 		UndamPageHeader* pg = (UndamPageHeader*)BufferGetPage(buf);
 		GenericXLogState* xlogState = NULL;
 		uint64 nDeleted = 0;
@@ -2238,14 +2251,15 @@ undam_relation_vacuum(Relation rel,
 					TransactionId xmin = HeapTupleHeaderGetRawXmin(&tup->hdr);
 					if (TransactionIdPrecedes(xmin, oldestXmin)) /* Tuple is visible for everybody */
 					{
-						if (xlogState == NULL) 
+						if (xlogState == NULL)
 						{
+							/* Retry scan of page under execlusive lock */
 							LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 							LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 							xlogState = GenericXLogStart(rel);
 							pg = (UndamPageHeader*)GenericXLogRegisterBuffer(xlogState, buf, 0);
-							chunk = 0;
-							continue; /* Retry scan of page under execlusive lock */
+							chunk = 0; /* will be incremented by for */
+							continue;
 						}
 						tuple.t_data = &tup->hdr;
 						tuple.t_len =  HeapTupleHeaderGetDatumLength(&tup->hdr);
@@ -2265,7 +2279,7 @@ undam_relation_vacuum(Relation rel,
 						}
 						if (tup->undoChain != INVALID_POSITION)
 						{
-							/* We do not ndeed undo chain any more */
+							/* We do not need undo chain any more */
 							UndamDeleteTuple(rel, tup->undoChain);
 							tup->undoChain = INVALID_POSITION;
 						}
@@ -2289,10 +2303,10 @@ undam_relation_vacuum(Relation rel,
 									GenericXLogState* vxlogState = GenericXLogStart(rel);
 									LockBuffer(vbuf, BUFFER_LOCK_UNLOCK);
 									LockBuffer(vbuf, BUFFER_LOCK_EXCLUSIVE);
-									vpg = (UndamPageHeader*)GenericXLogRegisterBuffer(xlogState, vbuf, 0);
+									vpg = (UndamPageHeader*)GenericXLogRegisterBuffer(vxlogState, vbuf, 0);
 									ver = (UndamTupleHeader*)((char*)vpg + POSITION_GET_BLOCK_OFFSET(undo));
 									Assert(ver->undoChain != INVALID_POSITION);
-									UndamDeleteTuple(rel, ver->undoChain);
+									UndamDeleteTuple(rel, ver->undoChain); /* delete rest of chain */
 									ver->undoChain = INVALID_POSITION;
 									GenericXLogFinish(vxlogState);
 								}
@@ -2719,7 +2733,7 @@ undam_scan_analyze_next_block(TableScanDesc scan, BlockNumber blockno,
 	if (blockno >= uscan->lastBlock)
 		return false;
 
-	ItemPointerSet(&uscan->currItem, blockno, 1);
+	ItemPointerSet(&uscan->currItem, blockno, 0); /* will be incremented by analyze_next_tuple */
     return true;
 }
 
@@ -2731,7 +2745,7 @@ undam_scan_analyze_next_tuple(TableScanDesc scan, TransactionId OldestXmin,
     Relation      rel = scan->rs_rd;
 	UndamRelationInfo* relinfo = UndamGetRelationInfo(rel);
     UndamScanDesc uscan = (UndamScanDesc) scan;
-	int           item = ItemPointerGetOffsetNumber(&uscan->currItem);
+	int           item = ItemPointerGetOffsetNumber(&uscan->currItem) + 1;
 	BlockNumber   blocknum = ItemPointerGetBlockNumber(&uscan->currItem);
 	int           nChunks = CHUNKS_PER_BLOCK;
 	Buffer        buf = ReadBufferExtended(rel, MAIN_FORKNUM, blocknum, RBM_ZERO_ON_ERROR, NULL);
@@ -2741,7 +2755,7 @@ undam_scan_analyze_next_tuple(TableScanDesc scan, TransactionId OldestXmin,
 
 	while (item < nChunks)
 	{
-		if (pg->allocMask[item >> 6] & ((uint64)1 << (item & 63)))
+		if (pg->allocMask[item >> 6] & ((uint64)1 << (item & 63))) /* item was allocated */
 		{
 			UndamTupleHeader* tup = (UndamTupleHeader*)((char*)pg + item*CHUNK_SIZE);
 			HeapTupleData tuphdr;
@@ -2836,7 +2850,7 @@ undam_scan_analyze_next_tuple(TableScanDesc scan, TransactionId OldestXmin,
 				int available = CHUNK_SIZE - offsetof(UndamTupleHeader, hdr);
 
 				*tuple = tuphdr;
-				tuple->t_data = (HeapTupleHeader)(tuple + 1); /* store tuple bosy just after the header */
+				tuple->t_data = (HeapTupleHeader)(tuple + 1); /* store tuple body just after the header */
 				if (len <= available)
 				{
 					memcpy(tuple->t_data, &tup->hdr, len);
@@ -3145,30 +3159,30 @@ void _PG_init(void)
 	add_int_reloption(UndamReloptKind, "chunk", "Size of allocation chunk", 64, MIN_CHUNK_SIZE, MAX_CHUNK_SIZE, AccessExclusiveLock);
 	add_int_reloption(UndamReloptKind, "chains", "Number of allocation chains", 8, 1, MAX_ALLOC_CHAINS, AccessExclusiveLock);
 
-       DefineCustomIntVariable("undam.chunk_size",
-							   "Size of allocation chunk.",
-                                                       NULL,
-                                                       &UndamChunkSize,
-                                                       64,
-                                                       MIN_CHUNK_SIZE,
-                                                       MAX_CHUNK_SIZE,
-                                                       PGC_USERSET,
-                                                       0,
-                                                       NULL,
-                                                       NULL,
-                                                       NULL);
-       DefineCustomIntVariable("undam.alloc_chains",
-                            "Number of allocation chains.",
-                                                       NULL,
-                                                       &UndamNAllocChains,
-                                                       8,
-                                                       1,
-                                                       MAX_ALLOC_CHAINS,
-                                                       PGC_USERSET,
-                                                       0,
-                                                       NULL,
-                                                       NULL,
-                                                       NULL);
+	DefineCustomIntVariable("undam.chunk_size",
+							"Size of allocation chunk.",
+							NULL,
+							&UndamChunkSize,
+							64,
+							MIN_CHUNK_SIZE,
+							MAX_CHUNK_SIZE,
+							PGC_USERSET,
+							0,
+							NULL,
+							NULL,
+							NULL);
+	DefineCustomIntVariable("undam.alloc_chains",
+							"Number of allocation chains.",
+							NULL,
+							&UndamNAllocChains,
+							8,
+							1,
+							MAX_ALLOC_CHAINS,
+							PGC_USERSET,
+							0,
+							NULL,
+							NULL,
+							NULL);
 
 	DefineCustomIntVariable("undam.max_relations",
                             "Maximal number of UNDAM relations.",
