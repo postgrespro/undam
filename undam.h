@@ -36,7 +36,7 @@ typedef struct
 typedef struct
 {
 	BlockNumber head; /* head of L1 list of not-full pages */
-	BlockNumber tail; /* first unused page */
+	BlockNumber tail; /* last allocated page */
 } UndamAllocList;
 
 /*
@@ -71,7 +71,7 @@ typedef struct
  * Undam page header. First chunk of the page is not used for data and as far as minimal size of chunk is 64 bytes,
  * there are no string reasons to minimize size of pgae header. Size of standard Postgres page header is 24 bytes,
  * we add three pointers for allocation chains (next/head/tail) - yet another 12 bytes, plus 4 bytes for storing
- * allolcation metainformation (filled only at root pages) and still we have more than enough space for bitmap.
+ * allacation metainformation (filled only at root pages) and still we have more than enough space for bitmap.
  */
 typedef struct
 {
@@ -89,7 +89,7 @@ typedef struct
 
 	BlockNumber    next; /* pointer to next page in L1 list of not-full pages */
 	BlockNumber    head; /* head of L1 list of not-full pages */
-	BlockNumber    tail; /* last free page */
+	BlockNumber    tail; /* last allocated page */
 	uint16         chunkSize; /* size of chunk: used to verify data format */
 	uint16         nChains; /* number of allocation chains: used to verify data format */
 	uint64         allocMask[FLEXIBLE_ARRAY_MEMBER];
