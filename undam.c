@@ -52,9 +52,26 @@ static relopt_kind UndamReloptKind;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 
 
+
 /********************************************************************
  * Main Undam functions
  ********************************************************************/
+
+/*
+ * Read and if necesary intialize new page. We have to switch on zero_damahged_pages to allow
+ * reading beyond end of file. Alternatively we have to use relation extension lock which
+ * can be a battleneck and limit concurrency.
+ */
+static Buffer
+UndamReadBuffer(Relation reln, ForkNumber forkNum, BlockNumber blockNum)
+{
+	bool save_zero_damaged_pages = zero_damaged_pages;
+	Buffer buf;
+	zero_damaged_pages = true;
+	buf = ReadBufferExtended(reln, forkNum, blockNum, RBM_NORMAL, NULL);
+	zero_damaged_pages = save_zero_damaged_pages;
+	return buf;
+}
 
 /*
  * Locate allocation chain for the relation and initialize first UndamNAllocChains blocks of relation of not initialized yet.
@@ -71,7 +88,7 @@ UndamGetRelationInfo(Relation rel)
 		{
 			for (int chain = 0; chain < nAllocChains; chain++)
 			{
-				Buffer buf = ReadBufferExtended(rel, fork, chain, RBM_NORMAL, NULL);
+				Buffer buf = UndamReadBuffer(rel, fork, chain);
 				UndamPageHeader* pg = (UndamPageHeader*)BufferGetPage(buf);
 
 				LockBuffer(buf, BUFFER_LOCK_SHARE);
@@ -132,33 +149,21 @@ UndamShmemStartup(void)
 }
 
 /*
- * Read and if necesary intialize new page. We have to switch on zero_damahged_pages to allow
- * reading beyond end of file. Alternatively we have to use relation extension lock which
- * can be a battleneck and limit concurrency.
- */
-static Buffer
-SafeReadBuffer(Relation reln, ForkNumber forkNum, BlockNumber blockNum)
-{
-	bool save_zero_damaged_pages = zero_damaged_pages;
-	Buffer buf;
-	zero_damaged_pages = true;
-	buf = ReadBufferExtended(reln, forkNum, blockNum, RBM_NORMAL, NULL);
-	zero_damaged_pages = save_zero_damaged_pages;
-	return buf;
-}
-
-/*
  * Save chain of chunks representing tuple to the database.
  * For object consisting of more than one chunk tail is always written after head so that we always observer consistent chain.
+ * If "tupSize" is not zero, then header chunk is written. In this case "data" points to HeapTupleHeader.
  * Returns position of first chunk in the chain.
  */
 static UndamPosition
-UndamWriteData(Relation rel, int forknum, char* data, size_t size, UndamPosition undoPos, bool isHeader, UndamPosition tailChunk)
+UndamWriteData(Relation rel, int forknum, char* data, uint32 size, UndamPosition undoPos, uint32 tupSize, UndamPosition tailChunk)
 {
 	UndamRelationInfo* relinfo = UndamGetRelationInfo(rel);
 	int chunkDataSize = CHUNK_SIZE - offsetof(UndamTupleChunk, data); /* We use UndamTupleChunk for estimating of size of data stored in tuple, because head chunk is always written separately */
 	int nChunks = (size + chunkDataSize - 1) / chunkDataSize;
 	int available = size - (nChunks-1) * chunkDataSize;
+
+	Assert(undoPos != 0 && tailChunk != 0);
+
  	do
 	{
 		int chainNo = random() % N_ALLOC_CHAINS; /* choose random chain to minimize probability of allocation chain buffer lock conflicts */
@@ -172,13 +177,13 @@ UndamWriteData(Relation rel, int forknum, char* data, size_t size, UndamPosition
 
 		if (blocknum == InvalidBlockNumber) /* Allocation chain is empty */
 		{
-			chainBuf = ReadBufferExtended(rel, forknum, BLCKSZ*chainNo, RBM_NORMAL, NULL);
+			chainBuf = UndamReadBuffer(rel, forknum, chainNo);
 			chain = (UndamPageHeader*)GenericXLogRegisterBuffer(xlogState, chainBuf, 0);
 			LockBuffer(chainBuf, BUFFER_LOCK_EXCLUSIVE);
 			if (chain->head == InvalidBlockNumber) /* extend chain */
 			{
 				Assert(relinfo->chains[chainNo].forks[forknum].tail == chain->tail);
-				blocknum = chain->tail += N_ALLOC_CHAINS*BLCKSZ;
+				blocknum = chain->tail += N_ALLOC_CHAINS;
 				chain->head = blocknum;
 				relinfo->chains[chainNo].forks[forknum].tail = blocknum;
 				relinfo->chains[chainNo].forks[forknum].head = blocknum;
@@ -186,7 +191,7 @@ UndamWriteData(Relation rel, int forknum, char* data, size_t size, UndamPosition
 			else
 				blocknum = chain->head;
 		}
-		buf = SafeReadBuffer(rel, forknum, blocknum);
+		buf = UndamReadBuffer(rel, forknum, blocknum);
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 		pg = (UndamPageHeader*)GenericXLogRegisterBuffer(xlogState, buf, 0);
 
@@ -209,12 +214,13 @@ UndamWriteData(Relation rel, int forknum, char* data, size_t size, UndamPosition
 
 			if (item != 0)  /* has some free space */
 			{
-				if (isHeader)
+				if (tupSize != 0) /* Header chunk */
 				{
 					UndamTupleHeader* tup = (UndamTupleHeader*)((char*)pg + item*CHUNK_SIZE);
 					memcpy(&tup->hdr, data, size);
 					tup->undoChain = undoPos;
 					tup->nextChunk = tailChunk;
+					tup->size = tupSize;
 					Assert(nChunks == 1);
 				}
 				else
@@ -238,7 +244,6 @@ UndamWriteData(Relation rel, int forknum, char* data, size_t size, UndamPosition
 			BlockNumber nextFree = pg->next;
 
 			pg->pd_flags |= PD_PAGE_FULL;
-			GenericXLogFinish(xlogState);
 
 			if (chainNo != blocknum) /* target chunk is not chain header */
 			{
@@ -246,7 +251,7 @@ UndamWriteData(Relation rel, int forknum, char* data, size_t size, UndamPosition
 				{
 					Assert(chainBuf == InvalidBuffer);
 					/* Locate block with chain header */
-					chainBuf = ReadBufferExtended(rel, forknum, BLCKSZ*chainNo, RBM_NORMAL, NULL);
+					chainBuf = UndamReadBuffer(rel, forknum, chainNo);
 					LockBuffer(chainBuf, BUFFER_LOCK_EXCLUSIVE);
 					chain = (UndamPageHeader*)GenericXLogRegisterBuffer(xlogState, chainBuf, 0);
 				}
@@ -270,6 +275,7 @@ UndamWriteData(Relation rel, int forknum, char* data, size_t size, UndamPosition
 	}
 	while (nChunks != 0);
 
+	Assert(tailChunk != 0);
 	return tailChunk;
 }
 
@@ -286,14 +292,14 @@ UndamInsertTuple(Relation rel, int forknum, HeapTuple tuple)
 
 	if (tuple->t_len <= available) /* Fit in one chunk */
 	{
-		pos = UndamWriteData(rel, forknum, (char*)tuple->t_data, tuple->t_len, INVALID_POSITION, true, INVALID_POSITION);
+		pos = UndamWriteData(rel, forknum, (char*)tuple->t_data, tuple->t_len, INVALID_POSITION, tuple->t_len, INVALID_POSITION);
 	}
 	else /* Tuple doesn't fit in chunk */
 	{
 		/* First write tail... */
-		pos = UndamWriteData(rel, EXT_FORKNUM, (char*)tuple->t_data + available, tuple->t_len - available, INVALID_POSITION, false, INVALID_POSITION);
+		pos = UndamWriteData(rel, EXT_FORKNUM, (char*)tuple->t_data + available, tuple->t_len - available, INVALID_POSITION, 0, INVALID_POSITION);
 		/* ... and then head */
-		pos = UndamWriteData(rel, forknum, (char*)tuple->t_data, available, INVALID_POSITION, true, pos);
+		pos = UndamWriteData(rel, forknum, (char*)tuple->t_data, available, INVALID_POSITION, tuple->t_len, pos);
 	}
 	ItemPointerSet(&tuple->t_self, POSITION_GET_BLOCK_NUMBER(pos), POSITION_GET_ITEM(pos));
 }
@@ -311,18 +317,23 @@ UndamUpdateTuple(Relation rel, HeapTuple tuple, Buffer buffer)
 	GenericXLogState* xlogState = GenericXLogStart(rel);
 	UndamPageHeader* pg = (UndamPageHeader*)GenericXLogRegisterBuffer(xlogState, buffer, 0);
 	UndamTupleHeader* old = (UndamTupleHeader*)((char*)pg + offs);
-	int len = Min(HeapTupleHeaderGetDatumLength(&old->hdr), available);
+	int len = Min(old->size, available);
+	Assert(len > 0);
 
 	/* Create copy of head chunk */
-	old->undoChain = UndamWriteData(rel, EXT_FORKNUM, (char*)old, len, old->undoChain, true, old->nextChunk);
+	old->undoChain = UndamWriteData(rel, EXT_FORKNUM, (char*)&old->hdr, len, old->undoChain, old->size, old->nextChunk);
 
 	len = Min(tuple->t_len, available);
 	memcpy(&old->hdr, tuple->t_data, len); /* in-place update of head chunk */
+	old->hdr.t_ctid = tuple->t_self;
+	old->size = tuple->t_len;
 	if (tuple->t_len > available)
 	{
 		/* Write tail chunks. As far as we are writing them in another fork, there can not be deadlock caused by buffer lock conflict */
-		old->nextChunk = UndamWriteData(rel, EXT_FORKNUM, (char*)tuple->t_data + len, tuple->t_len - len, INVALID_POSITION, false, INVALID_POSITION);
+		old->nextChunk = UndamWriteData(rel, EXT_FORKNUM, (char*)tuple->t_data + len, tuple->t_len - len, INVALID_POSITION, 0, INVALID_POSITION);
 	}
+	else
+		old->nextChunk = INVALID_POSITION;
 	GenericXLogFinish(xlogState);
 	UnlockReleaseBuffer(buffer);
 }
@@ -348,14 +359,14 @@ UndamReadTuple(Relation rel, Snapshot snapshot, ItemPointer ip)
 
 	do
 	{
-		Buffer buf = ReadBufferExtended(rel, forknum, blocknum, RBM_NORMAL, NULL); /* Page is expected to be already initialized */
+		Buffer buf = UndamReadBuffer(rel, forknum, blocknum);
 		UndamPageHeader* pg = (UndamPageHeader*)BufferGetPage(buf);
 		UndamTupleHeader* tup = (UndamTupleHeader*)((char*)pg + offs);
 		int len;
 
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 
-		len = HeapTupleHeaderGetDatumLength(&tup->hdr);
+		len = tup->size;
 		tuphdr.t_data = &tup->hdr;
 		tuphdr.t_len = len;
 
@@ -385,7 +396,7 @@ UndamReadTuple(Relation rel, Snapshot snapshot, ItemPointer ip)
 					UndamTupleChunk* chunk;
 					Assert(next != INVALID_POSITION);
 					UnlockReleaseBuffer(buf);
-					buf = ReadBufferExtended(rel, EXT_FORKNUM, POSITION_GET_BLOCK_NUMBER(next), RBM_NORMAL, NULL);
+					buf = UndamReadBuffer(rel, EXT_FORKNUM, POSITION_GET_BLOCK_NUMBER(next));
 					pg = (UndamPageHeader*)BufferGetPage(buf);
 					chunk = (UndamTupleChunk*)((char*)pg + POSITION_GET_BLOCK_OFFSET(next));
 					LockBuffer(buf, BUFFER_LOCK_SHARE);
@@ -413,19 +424,19 @@ UndamReadTuple(Relation rel, Snapshot snapshot, ItemPointer ip)
  * Delete unused version of the tuple from extension fork.
  */
 static void
-UndamDeleteTuple(Relation rel, UndamPosition pos)
+UndamDeleteTuple(Relation rel, UndamPosition pos, UndamPosition undo)
 {
 	UndamRelationInfo* relinfo = UndamGetRelationInfo(rel);
 	BlockNumber blocknum = POSITION_GET_BLOCK_NUMBER(pos);
 	int item = POSITION_GET_ITEM(pos);
-	UndamPosition next, undo = 0; /* Zero undo position means that we are processing head chunk */
 
 	while (true)
 	{
-		Buffer buf = ReadBufferExtended(rel, EXT_FORKNUM, blocknum, RBM_NORMAL, NULL);
+		Buffer buf = UndamReadBuffer(rel, EXT_FORKNUM, blocknum);
 		GenericXLogState* xlogState = GenericXLogStart(rel);
 		UndamPageHeader* pg = (UndamPageHeader*)GenericXLogRegisterBuffer(xlogState, buf, 0);
 		Buffer chainBuf = InvalidBuffer;
+		UndamPosition next;
 
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 
@@ -436,12 +447,14 @@ UndamDeleteTuple(Relation rel, UndamPosition pos)
 		{
 			UndamTupleChunk* chunk = (UndamTupleChunk*)((char*)pg + item*CHUNK_SIZE);
 			next = chunk->next;
+			Assert(next != 0);
 		}
 		else
 		{
 			UndamTupleHeader* hdr = (UndamTupleHeader*)((char*)pg + item*CHUNK_SIZE);
 			undo = hdr->undoChain;
 			next = hdr->nextChunk;
+			Assert(undo != 0 && next != 0); /* 0 is not valid position value */
 		}
 		if (pg->pd_flags & PD_PAGE_FULL) /* page was full: include it in allocation chain  */
 		{
@@ -452,7 +465,7 @@ UndamDeleteTuple(Relation rel, UndamPosition pos)
 
 			if (chainNo != blocknum) /* check if allocation chain header is at the same page */
 			{
-				chainBuf = ReadBufferExtended(rel, EXT_FORKNUM, chainNo*BLCKSZ, RBM_NORMAL, NULL);
+				chainBuf = UndamReadBuffer(rel, EXT_FORKNUM, chainNo);
 				LockBuffer(chainBuf, BUFFER_LOCK_EXCLUSIVE);
 				chain = (UndamPageHeader*)GenericXLogRegisterBuffer(xlogState, chainBuf, 0);
 				Assert(chain->head == relinfo->chains[chainNo].forks[EXT_FORKNUM].head);
@@ -1094,86 +1107,6 @@ l5:
 }
 
 /*
- * Does the given multixact conflict with the current transaction grabbing a
- * tuple lock of the given strength?
- *
- * The passed infomask pairs up with the given multixact in the tuple header.
- *
- * If current_is_member is not NULL, it is set to 'true' if the current
- * transaction is a member of the given multixact.
- */
-static bool
-DoesMultiXactIdConflict(MultiXactId multi, uint16 infomask,
-						LockTupleMode lockmode, bool *current_is_member)
-{
-	int			nmembers;
-	MultiXactMember *members;
-	bool		result = false;
-	LOCKMODE	wanted = tupleLockExtraInfo[lockmode].hwlock;
-
-	if (HEAP_LOCKED_UPGRADED(infomask))
-		return false;
-
-	nmembers = GetMultiXactIdMembers(multi, &members, false,
-									 HEAP_XMAX_IS_LOCKED_ONLY(infomask));
-	if (nmembers >= 0)
-	{
-		int			i;
-
-		for (i = 0; i < nmembers; i++)
-		{
-			TransactionId memxid;
-			LOCKMODE	memlockmode;
-
-			if (result && (current_is_member == NULL || *current_is_member))
-				break;
-
-			memlockmode = LOCKMODE_from_mxstatus(members[i].status);
-
-			/* ignore members from current xact (but track their presence) */
-			memxid = members[i].xid;
-			if (TransactionIdIsCurrentTransactionId(memxid))
-			{
-				if (current_is_member != NULL)
-					*current_is_member = true;
-				continue;
-			}
-			else if (result)
-				continue;
-
-			/* ignore members that don't conflict with the lock we want */
-			if (!DoLockModesConflict(memlockmode, wanted))
-				continue;
-
-			if (ISUPDATE_from_mxstatus(members[i].status))
-			{
-				/* ignore aborted updaters */
-				if (TransactionIdDidAbort(memxid))
-					continue;
-			}
-			else
-			{
-				/* ignore lockers-only that are no longer in progress */
-				if (!TransactionIdIsInProgress(memxid))
-					continue;
-			}
-
-			/*
-			 * Whatever remains are either live lockers that conflict with our
-			 * wanted lock, and updaters that are not aborted.  Those conflict
-			 * with what we want.  Set up to return true, but keep going to
-			 * look for the current transaction among the multixact members,
-			 * if needed.
-			 */
-			result = true;
-		}
-		pfree(members);
-	}
-
-	return result;
-}
-
-/*
  * Acquire heavyweight locks on tuples, using a LockTupleMode strength value.
  * This is more readable than having every caller translate it to lock.h's
  * LOCKMODE.
@@ -1227,173 +1160,19 @@ heap_acquire_tuplock(Relation relation, ItemPointer tid, LockTupleMode mode,
 
 	return true;
 }
-
-/*
- * Do_MultiXactIdWait
- *		Actual implementation for the two functions below.
- *
- * 'multi', 'status' and 'infomask' indicate what to sleep on (the status is
- * needed to ensure we only sleep on conflicting members, and the infomask is
- * used to optimize multixact access in case it's a lock-only multi); 'nowait'
- * indicates whether to use conditional lock acquisition, to allow callers to
- * fail if lock is unavailable.  'rel', 'ctid' and 'oper' are used to set up
- * context information for error messages.  'remaining', if not NULL, receives
- * the number of members that are still running, including any (non-aborted)
- * subtransactions of our own transaction.
- *
- * We do this by sleeping on each member using XactLockTableWait.  Any
- * members that belong to the current backend are *not* waited for, however;
- * this would not merely be useless but would lead to Assert failure inside
- * XactLockTableWait.  By the time this returns, it is certain that all
- * transactions *of other backends* that were members of the MultiXactId
- * that conflict with the requested status are dead (and no new ones can have
- * been added, since it is not legal to add members to an existing
- * MultiXactId).
- *
- * But by the time we finish sleeping, someone else may have changed the Xmax
- * of the containing tuple, so the caller needs to iterate on us somehow.
- *
- * Note that in case we return false, the number of remaining members is
- * not to be trusted.
- */
-static bool
-Do_MultiXactIdWait(MultiXactId multi, MultiXactStatus status,
-				   uint16 infomask, bool nowait,
-				   Relation rel, ItemPointer ctid, XLTW_Oper oper,
-				   int *remaining)
-{
-	bool		result = true;
-	MultiXactMember *members;
-	int			nmembers;
-	int			remain = 0;
-
-	/* for pre-pg_upgrade tuples, no need to sleep at all */
-	nmembers = HEAP_LOCKED_UPGRADED(infomask) ? -1 :
-		GetMultiXactIdMembers(multi, &members, false,
-							  HEAP_XMAX_IS_LOCKED_ONLY(infomask));
-
-	if (nmembers >= 0)
-	{
-		int			i;
-
-		for (i = 0; i < nmembers; i++)
-		{
-			TransactionId memxid = members[i].xid;
-			MultiXactStatus memstatus = members[i].status;
-
-			if (TransactionIdIsCurrentTransactionId(memxid))
-			{
-				remain++;
-				continue;
-			}
-
-			if (!DoLockModesConflict(LOCKMODE_from_mxstatus(memstatus),
-									 LOCKMODE_from_mxstatus(status)))
-			{
-				if (remaining && TransactionIdIsInProgress(memxid))
-					remain++;
-				continue;
-			}
-
-			/*
-			 * This member conflicts with our multi, so we have to sleep (or
-			 * return failure, if asked to avoid waiting.)
-			 *
-			 * Note that we don't set up an error context callback ourselves,
-			 * but instead we pass the info down to XactLockTableWait.  This
-			 * might seem a bit wasteful because the context is set up and
-			 * tore down for each member of the multixact, but in reality it
-			 * should be barely noticeable, and it avoids duplicate code.
-			 */
-			if (nowait)
-			{
-				result = ConditionalXactLockTableWait(memxid);
-				if (!result)
-					break;
-			}
-			else
-				XactLockTableWait(memxid, rel, ctid, oper);
-		}
-
-		pfree(members);
-	}
-
-	if (remaining)
-		*remaining = remain;
-
-	return result;
-}
-
-/*
- * MultiXactIdWait
- *		Sleep on a MultiXactId.
- *
- * By the time we finish sleeping, someone else may have changed the Xmax
- * of the containing tuple, so the caller needs to iterate on us somehow.
- *
- * We return (in *remaining, if not NULL) the number of members that are still
- * running, including any (non-aborted) subtransactions of our own transaction.
- */
 static void
-MultiXactIdWait(MultiXactId multi, MultiXactStatus status, uint16 infomask,
-				Relation rel, ItemPointer ctid, XLTW_Oper oper,
-				int *remaining)
+UpdateXminHintBits(HeapTupleHeader tuple, Buffer buffer, TransactionId xid)
 {
-	(void) Do_MultiXactIdWait(multi, status, infomask, false,
-							  rel, ctid, oper, remaining);
-}
-
-/*
- * Given two versions of the same t_infomask for a tuple, compare them and
- * return whether the relevant status for a tuple Xmax has changed.  This is
- * used after a buffer lock has been released and reacquired: we want to ensure
- * that the tuple state continues to be the same it was when we previously
- * examined it.
- *
- * Note the Xmax field itself must be compared separately.
- */
-static inline bool
-xmax_infomask_changed(uint16 new_infomask, uint16 old_infomask)
-{
-	const uint16 interesting =
-	HEAP_XMAX_IS_MULTI | HEAP_XMAX_LOCK_ONLY | HEAP_LOCK_MASK;
-
-	if ((new_infomask & interesting) != (old_infomask & interesting))
-		return true;
-
-	return false;
-}
-
-/*
- * UpdateXmaxHintBits - update tuple hint bits after xmax transaction ends
- *
- * This is called after we have waited for the XMAX transaction to terminate.
- * If the transaction aborted, we guarantee the XMAX_INVALID hint bit will
- * be set on exit.  If the transaction committed, we set the XMAX_COMMITTED
- * hint bit if possible --- but beware that that may not yet be possible,
- * if the transaction committed asynchronously.
- *
- * Note that if the transaction was a locker only, we set HEAP_XMAX_INVALID
- * even if it commits.
- *
- * Hence callers should look only at XMAX_INVALID.
- *
- * Note this is not allowed for tuples whose xmax is a multixact.
- */
-static void
-UpdateXmaxHintBits(HeapTupleHeader tuple, Buffer buffer, TransactionId xid)
-{
-	Assert(TransactionIdEquals(HeapTupleHeaderGetRawXmax(tuple), xid));
+	Assert(TransactionIdEquals(HeapTupleHeaderGetRawXmin(tuple), xid));
 	Assert(!(tuple->t_infomask & HEAP_XMAX_IS_MULTI));
 
 	if (!(tuple->t_infomask & (HEAP_XMAX_COMMITTED | HEAP_XMAX_INVALID)))
 	{
-		if (!HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask) &&
-			TransactionIdDidCommit(xid))
-			HeapTupleSetHintBits(tuple, buffer, HEAP_XMAX_COMMITTED,
+		if (TransactionIdDidCommit(xid))
+			HeapTupleSetHintBits(tuple, buffer, HEAP_XMIN_COMMITTED,
 								 xid);
 		else
-			HeapTupleSetHintBits(tuple, buffer, HEAP_XMAX_INVALID,
+			HeapTupleSetHintBits(tuple, buffer, HEAP_XMIN_INVALID,
 								 InvalidTransactionId);
 	}
 }
@@ -1457,7 +1236,7 @@ undam_getnextslot(TableScanDesc scan, ScanDirection direction, TupleTableSlot *s
 
 	while (blocknum < uscan->lastBlock)
 	{
-		Buffer buf = ReadBufferExtended(rel, MAIN_FORKNUM, blocknum, RBM_NORMAL, NULL);
+		Buffer buf = UndamReadBuffer(rel, MAIN_FORKNUM, blocknum);
 		UndamPageHeader* pg = (UndamPageHeader*)BufferGetPage(buf);
 
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
@@ -1553,7 +1332,7 @@ undam_scan_bitmap_next_block(TableScanDesc scan,
                             struct TBMIterateResult *tbmres)
 {
     UndamScanDesc uscan = (UndamScanDesc) scan;
-	ItemPointerSet(&uscan->currItem, tbmres->blockno, 0);
+	ItemPointerSet(&uscan->currItem, tbmres->blockno, 1);
 	return tbmres->blockno < uscan->lastBlock;
 }
 
@@ -1569,7 +1348,7 @@ undam_scan_bitmap_next_tuple(TableScanDesc scan,
 	int           offs = ItemPointerGetOffsetNumber(&uscan->currItem);
 	BlockNumber   blocknum = tbmres->blockno;
 	int           nChunks = CHUNKS_PER_BLOCK;
-	Buffer buf = ReadBufferExtended(rel, MAIN_FORKNUM, blocknum, RBM_NORMAL, NULL);
+	Buffer buf = UndamReadBuffer(rel, MAIN_FORKNUM, blocknum);
 	UndamPageHeader* pg = (UndamPageHeader*)BufferGetPage(buf);
 	bool found = false;
 
@@ -1581,15 +1360,15 @@ undam_scan_bitmap_next_tuple(TableScanDesc scan,
 		if (tbmres->ntuples >= 0)
 		{
 			/* for non-lossy scan offs points to the position in tbmres->offsets. */
-			if (offs >= tbmres->ntuples)
+			if (offs-1 >= tbmres->ntuples)  /* posid has to be greater than zero, so subtract one to use it as zero-based index in array */
 				break;
-			item = tbmres->offsets[offs];
+			item = tbmres->offsets[offs-1];
 			Assert(item > 0 && item < nChunks);
 		}
 		else /* lossy scan */
 		{
 			/* for lossy scan we interpret offs as a position in the block */
-			item = offs + 1; /* we need to skip first chunk used for page header */
+			item = offs;
  			if (item > nChunks)
 				break;
 		}
@@ -1633,7 +1412,7 @@ undam_tuple_tid_valid(TableScanDesc scan, ItemPointer tid)
 	UndamRelationInfo* relinfo = UndamGetRelationInfo(scan->rs_rd);
 	int item = ItemPointerGetOffsetNumber(&uscan->currItem);
 	BlockNumber   blocknum = ItemPointerGetBlockNumber(&uscan->currItem);
-	Buffer buf = ReadBufferExtended(scan->rs_rd, MAIN_FORKNUM, blocknum, RBM_NORMAL, NULL);
+	Buffer buf = UndamReadBuffer(scan->rs_rd, MAIN_FORKNUM, blocknum);
 	UndamPageHeader* pg = (UndamPageHeader*)BufferGetPage(buf);
 	bool is_valid;
 
@@ -1653,7 +1432,7 @@ undam_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot,
 {
 	HeapTupleTableSlot *hslot = (HeapTupleTableSlot *) slot;
 	BlockNumber   blocknum = ItemPointerGetBlockNumber(&slot->tts_tid);
-	Buffer buf = ReadBufferExtended(rel, MAIN_FORKNUM, blocknum, RBM_NORMAL, NULL);
+	Buffer buf = UndamReadBuffer(rel, MAIN_FORKNUM, blocknum);
 	bool satisfies;
 
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
@@ -1726,7 +1505,6 @@ undam_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
 	bool		shouldFree = true;
 	HeapTuple   origtup;
 	HeapTuple   newtup = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
-	MultiXactStatus mxact_status;
 	bool		key_intact;
 	bool		checked_lockers;
 	bool		locker_remains;
@@ -1741,6 +1519,7 @@ undam_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
 	Buffer      buffer;
 	Page		page;
 	TM_Result   result;
+	UndamTupleHeader* tup;
 
 	Assert(ItemPointerIsValid(otid));
 
@@ -1764,7 +1543,6 @@ undam_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
 	if (!bms_is_empty(modified_attrs))
 	{
 		*lockmode = LockTupleNoKeyExclusive;
-		mxact_status = MultiXactStatusNoKeyUpdate;
 		key_intact = true;
 
 		/*
@@ -1781,16 +1559,16 @@ undam_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
 	else
 	{
 		*lockmode = LockTupleExclusive;
-		mxact_status = MultiXactStatusUpdate;
 		key_intact = false;
 	}
 
-	buffer = ReadBufferExtended(relation, MAIN_FORKNUM, ItemPointerGetBlockNumber(otid), RBM_NORMAL, NULL);
+	buffer = UndamReadBuffer(relation, MAIN_FORKNUM, ItemPointerGetBlockNumber(otid));
 	page = BufferGetPage(buffer);
 	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+	tup = (UndamTupleHeader*)((char*)page + ItemPointerGetOffsetNumber(otid)*CHUNK_SIZE);
 	oldtup.t_tableOid = RelationGetRelid(relation);
-	oldtup.t_data = &((UndamTupleHeader*)((char*)page + ItemPointerGetOffsetNumber(otid)*CHUNK_SIZE))->hdr;
-	oldtup.t_len = HeapTupleHeaderGetDatumLength(oldtup.t_data);
+	oldtup.t_data = &tup->hdr;
+	oldtup.t_len = tup->size;
 	oldtup.t_self = *otid;
 
 l2:
@@ -1799,19 +1577,11 @@ l2:
 	result = HeapTupleSatisfiesUpdate(&oldtup, cid, buffer);
 
 	/* see below about the "no wait" case */
-	Assert(result != TM_BeingModified || wait);
+	Assert(result != TM_BeingModified && (result != TM_Invisible || wait));
 
-	if (result == TM_Invisible)
-	{
-		UnlockReleaseBuffer(buffer);
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("attempted to update invisible tuple")));
-	}
-	else if (result == TM_BeingModified && wait)
+	if (result == TM_Invisible && wait)
 	{
 		TransactionId xwait;
-		uint16		infomask;
 		bool		can_continue = false;
 
 		/*
@@ -1827,120 +1597,13 @@ l2:
 		 * heap_update directly.
 		 */
 
-		xwait = HeapTupleHeaderGetRawXmax(oldtup.t_data);
-		infomask = oldtup.t_data->t_infomask;
+		xwait = HeapTupleHeaderGetRawXmin(oldtup.t_data);
 
-		/*
-		 * Now we have to do something about the existing locker.  If it's a
-		 * multi, sleep on it; we might be awakened before it is completely
-		 * gone (or even not sleep at all in some cases); we need to preserve
-		 * it as locker, unless it is gone completely.
-		 *
-		 * If it's not a multi, we need to check for sleeping conditions
-		 * before actually going to sleep.  If the update doesn't conflict
-		 * with the locks, we just continue without sleeping (but making sure
-		 * it is preserved).
-		 *
-		 * Before sleeping, we need to acquire tuple lock to establish our
-		 * priority for the tuple (see heap_lock_tuple).  LockTuple will
-		 * release us when we are next-in-line for the tuple.  Note we must
-		 * not acquire the tuple lock until we're sure we're going to sleep;
-		 * otherwise we're open for race conditions with other transactions
-		 * holding the tuple lock which sleep on us.
-		 *
-		 * If we are forced to "start over" below, we keep the tuple lock;
-		 * this arranges that we stay at the head of the line while rechecking
-		 * tuple state.
-		 */
-		if (infomask & HEAP_XMAX_IS_MULTI)
-		{
-			TransactionId update_xact;
-			int			remain;
-			bool		current_is_member = false;
-
-			if (DoesMultiXactIdConflict((MultiXactId) xwait, infomask,
-										*lockmode, &current_is_member))
-			{
-				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-
-				/*
-				 * Acquire the lock, if necessary (but skip it when we're
-				 * requesting a lock and already have one; avoids deadlock).
-				 */
-				if (!current_is_member)
-					heap_acquire_tuplock(relation, &(oldtup.t_self), *lockmode,
-										 LockWaitBlock, &have_tuple_lock);
-
-				/* wait for multixact */
-				MultiXactIdWait((MultiXactId) xwait, mxact_status, infomask,
-								relation, &oldtup.t_self, XLTW_Update,
-								&remain);
-				checked_lockers = true;
-				locker_remains = remain != 0;
-				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
-
-				/*
-				 * If xwait had just locked the tuple then some other xact
-				 * could update this tuple before we get to this point.  Check
-				 * for xmax change, and start over if so.
-				 */
-				if (xmax_infomask_changed(oldtup.t_data->t_infomask,
-										  infomask) ||
-					!TransactionIdEquals(HeapTupleHeaderGetRawXmax(oldtup.t_data),
-										 xwait))
-					goto l2;
-			}
-
-			/*
-			 * Note that the multixact may not be done by now.  It could have
-			 * surviving members; our own xact or other subxacts of this
-			 * backend, and also any other concurrent transaction that locked
-			 * the tuple with LockTupleKeyShare if we only got
-			 * LockTupleNoKeyExclusive.  If this is the case, we have to be
-			 * careful to mark the updated tuple with the surviving members in
-			 * Xmax.
-			 *
-			 * Note that there could have been another update in the
-			 * MultiXact. In that case, we need to check whether it committed
-			 * or aborted. If it aborted we are safe to update it again;
-			 * otherwise there is an update conflict, and we have to return
-			 * TableTuple{Deleted, Updated} below.
-			 *
-			 * In the LockTupleExclusive case, we still need to preserve the
-			 * surviving members: those would include the tuple locks we had
-			 * before this one, which are important to keep in case this
-			 * subxact aborts.
-			 */
-			if (!HEAP_XMAX_IS_LOCKED_ONLY(oldtup.t_data->t_infomask))
-				update_xact = HeapTupleGetUpdateXid(oldtup.t_data);
-			else
-				update_xact = InvalidTransactionId;
-
-			/*
-			 * There was no UPDATE in the MultiXact; or it aborted. No
-			 * TransactionIdIsInProgress() call needed here, since we called
-			 * MultiXactIdWait() above.
-			 */
-			if (!TransactionIdIsValid(update_xact) ||
-				TransactionIdDidAbort(update_xact))
-				can_continue = true;
-		}
-		else if (TransactionIdIsCurrentTransactionId(xwait))
+		if (TransactionIdIsCurrentTransactionId(xwait))
 		{
 			/*
 			 * The only locker is ourselves; we can avoid grabbing the tuple
 			 * lock here, but must preserve our locking information.
-			 */
-			checked_lockers = true;
-			locker_remains = true;
-			can_continue = true;
-		}
-		else if (HEAP_XMAX_IS_KEYSHR_LOCKED(infomask) && key_intact)
-		{
-			/*
-			 * If it's just a key-share locker, and we're not changing the key
-			 * columns, we don't need to wait for it to end; but we need to
-			 * preserve it as locker.
 			 */
 			checked_lockers = true;
 			locker_remains = true;
@@ -1965,21 +1628,17 @@ l2:
 			 * other xact could update this tuple before we get to this point.
 			 * Check for xmax change, and start over if so.
 			 */
-			if (xmax_infomask_changed(oldtup.t_data->t_infomask, infomask) ||
-				!TransactionIdEquals(xwait,
-									 HeapTupleHeaderGetRawXmax(oldtup.t_data)))
+			if (!TransactionIdEquals(xwait,
+									 HeapTupleHeaderGetRawXmin(oldtup.t_data)))
 				goto l2;
-
-			/* Otherwise check if it committed or aborted */
-			UpdateXmaxHintBits(oldtup.t_data, buffer, xwait);
-			if (oldtup.t_data->t_infomask & HEAP_XMAX_INVALID)
+			UpdateXminHintBits(oldtup.t_data, buffer, xwait);
+			if (oldtup.t_data->t_infomask & HEAP_XMIN_INVALID)
 				can_continue = true;
 		}
 
 		if (can_continue)
 			result = TM_Ok;
-		else if (!ItemPointerEquals(&oldtup.t_self, &oldtup.t_data->t_ctid) ||
-				 HeapTupleHeaderIndicatesMovedPartitions(oldtup.t_data))
+		else if (oldtup.t_data->t_infomask & HEAP_XMAX_INVALID)
 			result = TM_Updated;
 		else
 			result = TM_Deleted;
@@ -2000,10 +1659,8 @@ l2:
 		Assert(result == TM_SelfModified ||
 			   result == TM_Updated ||
 			   result == TM_Deleted ||
-			   result == TM_BeingModified);
-		Assert(!(oldtup.t_data->t_infomask & HEAP_XMAX_INVALID));
-		Assert(result != TM_Updated ||
-			   !ItemPointerEquals(&oldtup.t_self, &oldtup.t_data->t_ctid));
+			   result == TM_Invisible);
+		Assert(!(oldtup.t_data->t_infomask & HEAP_XMIN_INVALID));
 		tmfd->ctid = oldtup.t_data->t_ctid;
 		tmfd->xmax = HeapTupleHeaderGetUpdateXid(oldtup.t_data);
 		if (result == TM_SelfModified)
@@ -2160,7 +1817,14 @@ undam_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
                   LockWaitPolicy wait_policy, uint8 flags,
                   TM_FailureData *tmfd)
 {
-	NOT_IMPLEMENTED;
+	HeapTuple tuple = UndamReadTuple(relation, SnapshotAny, tid);
+	if (tuple != NULL) /* found some visible version */
+	{
+		ExecStoreHeapTuple(tuple, slot, true);
+		tmfd->traversed = true;
+		return TM_Ok;
+	}
+	return TM_Invisible;
 }
 
 static uint64
@@ -2236,7 +1900,7 @@ UndamVacuumIndexes(Relation rel, uint64* deadBitmap, uint64 reltuples, BufferAcc
 	/* TODO: do something with index stats */
 
 	/* Done with indexes */
-	vac_close_indexes(nindexes, Irel, NoLock);
+	vac_close_indexes(nindexes, Irel, RowExclusiveLock);
 }
 
 static void
@@ -2250,6 +1914,11 @@ undam_relation_vacuum(Relation rel,
 	HeapTupleData tuple;
 	uint64 nTuples  = (uint64)lastBlock*nChunks;
 	uint64* deadBitmap = (uint64*)calloc((nTuples+63)/64, 8); /* bitmap can be larger than 1Gb, so use calloc */
+	uint64  nDeadTuples = 0;
+	uint64  nVisibleForAllTuples = 0;
+	uint64  nFrozenTuples = 0;
+	uint64  nTruncatedUndoChains = 0;
+	uint64  nUndoVersions = 0;
 	TransactionId oldestXmin;
 	TransactionId freezeLimit;
 	MultiXactId   multiXactCutoff;
@@ -2266,13 +1935,15 @@ undam_relation_vacuum(Relation rel,
 						  NULL,
 						  &multiXactCutoff,
 						  NULL);
-
+	elog(LOG, "UNDAM: vacuum of relation %d started", RelationGetRelid(rel));
 	for (BlockNumber block = 0; block < lastBlock; block++)
 	{
-		Buffer buf = ReadBufferExtended(rel, MAIN_FORKNUM, block, RBM_NORMAL, NULL);
+		Buffer buf = UndamReadBuffer(rel, MAIN_FORKNUM, block);
 		UndamPageHeader* pg = (UndamPageHeader*)BufferGetPage(buf);
 		GenericXLogState* xlogState = NULL;
-		uint64 nDeleted = 0;
+		int nDeleted = 0;
+		int nVersions = 0;
+		int nVisible = 0;
 		Buffer chainBuf = InvalidBuffer;
 
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
@@ -2295,10 +1966,13 @@ undam_relation_vacuum(Relation rel,
 							xlogState = GenericXLogStart(rel);
 							pg = (UndamPageHeader*)GenericXLogRegisterBuffer(xlogState, buf, 0);
 							chunk = 0; /* will be incremented by for */
+							nVersions = 0;
+							nVisible = 0;
 							continue;
 						}
+						nVisible += 1;
 						tuple.t_data = &tup->hdr;
-						tuple.t_len =  HeapTupleHeaderGetDatumLength(&tup->hdr);
+						tuple.t_len =  tup->size;
 						if (HeapTupleSatisfiesVacuum(&tuple, oldestXmin, buf) == HEAPTUPLE_DEAD)
 						{
 							UndamPosition pos = GET_POSITION(block, chunk);
@@ -2306,18 +1980,20 @@ undam_relation_vacuum(Relation rel,
 							deadBitmap[pos >> 6] |= (uint64)1 << (pos & 63);
 							nDeleted += 1;
 							if (tup->nextChunk != INVALID_POSITION)
-								UndamDeleteTuple(rel, tup->nextChunk); /* delete tuple tail */
+								UndamDeleteTuple(rel, tup->nextChunk, INVALID_POSITION); /* delete tuple tail */
 						}
 						else if (TransactionIdPrecedes(xmin, freezeLimit))
 						{
 							/* TODO: not sure that it is enough to freeze tuple: or should we use heap_freeze_tuple ? */
 							tup->hdr.t_infomask |= HEAP_XMIN_FROZEN;
+							nFrozenTuples += 1;
 						}
 						if (tup->undoChain != INVALID_POSITION)
 						{
 							/* We do not need undo chain any more */
-							UndamDeleteTuple(rel, tup->undoChain);
+							UndamDeleteTuple(rel, tup->undoChain, 0);
 							tup->undoChain = INVALID_POSITION;
+							nTruncatedUndoChains += 1;
 						}
 					}
 					else /* Traverse undo chain */
@@ -2325,13 +2001,15 @@ undam_relation_vacuum(Relation rel,
 						UndamPosition undo = tup->undoChain;
 						while (undo != INVALID_POSITION)
 						{
-							Buffer vbuf = ReadBufferExtended(rel, MAIN_FORKNUM, POSITION_GET_BLOCK_NUMBER(undo), RBM_NORMAL, NULL);
+							Buffer vbuf = UndamReadBuffer(rel, EXT_FORKNUM, POSITION_GET_BLOCK_NUMBER(undo));
 							UndamPageHeader* vpg = (UndamPageHeader*)BufferGetPage(vbuf);
 							UndamTupleHeader* ver;
 
 							LockBuffer(vbuf, BUFFER_LOCK_SHARE);
-
+							nVersions += 1;
 							ver = (UndamTupleHeader*)((char*)vpg + POSITION_GET_BLOCK_OFFSET(undo));
+							Assert(ver->undoChain != 0);
+
 							if (TransactionIdPrecedes(HeapTupleHeaderGetRawXmin(&ver->hdr), oldestXmin)) /* Tuple is visible for everybody */
 							{
 								if (ver->undoChain != INVALID_POSITION)
@@ -2341,10 +2019,11 @@ undam_relation_vacuum(Relation rel,
 									LockBuffer(vbuf, BUFFER_LOCK_EXCLUSIVE);
 									vpg = (UndamPageHeader*)GenericXLogRegisterBuffer(vxlogState, vbuf, 0);
 									ver = (UndamTupleHeader*)((char*)vpg + POSITION_GET_BLOCK_OFFSET(undo));
-									Assert(ver->undoChain != INVALID_POSITION);
-									UndamDeleteTuple(rel, ver->undoChain); /* delete rest of chain */
+									Assert(ver->undoChain != INVALID_POSITION && ver->undoChain != 0);
+									UndamDeleteTuple(rel, ver->undoChain, 0); /* delete rest of chain */
 									ver->undoChain = INVALID_POSITION;
 									GenericXLogFinish(vxlogState);
+									nTruncatedUndoChains += 1;
 								}
 								UnlockReleaseBuffer(vbuf);
 								break;
@@ -2356,10 +2035,13 @@ undam_relation_vacuum(Relation rel,
 				}
 			}
 		}
+		nDeadTuples += nDeleted;
+		nVisibleForAllTuples += nVisible;
+		nUndoVersions += nVersions;
+
 		if (nDeleted != 0 && (pg->pd_flags & PD_PAGE_FULL))  /* page was full: include it in allocation chain  */
 		{
 			int chainNo = block % N_ALLOC_CHAINS;
-			Buffer chainBuf;
 			UndamPageHeader* chain;
 
 			Assert(xlogState != NULL);
@@ -2367,7 +2049,7 @@ undam_relation_vacuum(Relation rel,
 
 			if (chainNo != block) /* check if allocation chain header is at the same page */
 			{
-				chainBuf = ReadBufferExtended(rel, MAIN_FORKNUM, chainNo*BLCKSZ, RBM_NORMAL, NULL);
+				chainBuf = UndamReadBuffer(rel, MAIN_FORKNUM, chainNo);
 				LockBuffer(chainBuf, BUFFER_LOCK_EXCLUSIVE);
 				chain = (UndamPageHeader*)GenericXLogRegisterBuffer(xlogState, chainBuf, 0);
 				Assert(chain->head == relinfo->chains[chainNo].forks[MAIN_FORKNUM].head);
@@ -2375,7 +2057,6 @@ undam_relation_vacuum(Relation rel,
 			else
 			{
 				chain = pg;
-				chainBuf = InvalidBuffer;
 			}
 			/* Update chain header */
 			pg->next = chain->head;
@@ -2388,6 +2069,8 @@ undam_relation_vacuum(Relation rel,
 		if (chainBuf)
 			UnlockReleaseBuffer(chainBuf);
 	}
+	elog(LOG, "UNDAM: vacuum of relation %d completed: " UINT64_FORMAT " visible for all tuples, " UINT64_FORMAT " dead tuples, " UINT64_FORMAT " frozen tuples, " UINT64_FORMAT " truncated UNDO chains, " UINT64_FORMAT " UNDO versions",
+		 RelationGetRelid(rel), nVisibleForAllTuples, nDeadTuples, nFrozenTuples, nTruncatedUndoChains, nUndoVersions);
 
 	UndamVacuumIndexes(rel, deadBitmap, nTuples, bstrategy);
 	/* TODO: update statistic, relfrozenxid,... */
@@ -2437,86 +2120,20 @@ undam_tuple_delete(Relation relation, ItemPointer tid, CommandId cid,
 
 	tp.t_tableOid = RelationGetRelid(relation);
 	tp.t_data = &tup->hdr;
-	tp.t_len = HeapTupleHeaderGetDatumLength(&tup->hdr);
+	tp.t_len = tup->size;
 	tp.t_self = *tid;
 
 l1:
 	result = HeapTupleSatisfiesUpdate(&tp, cid, buffer);
 
-	if (result == TM_Invisible)
-	{
-		UnlockReleaseBuffer(buffer);
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("attempted to delete invisible tuple")));
-	}
-	else if (result == TM_BeingModified && wait)
+	if (result == TM_Invisible && wait)
 	{
 		TransactionId xwait;
-		uint16		infomask;
 
 		/* must copy state data before unlocking buffer */
-		xwait = HeapTupleHeaderGetRawXmax(tp.t_data);
-		infomask = tp.t_data->t_infomask;
+		xwait = HeapTupleHeaderGetRawXmin(tp.t_data);
 
-		/*
-		 * Sleep until concurrent transaction ends -- except when there's a
-		 * single locker and it's our own transaction.  Note we don't care
-		 * which lock mode the locker has, because we need the strongest one.
-		 *
-		 * Before sleeping, we need to acquire tuple lock to establish our
-		 * priority for the tuple (see heap_lock_tuple).  LockTuple will
-		 * release us when we are next-in-line for the tuple.
-		 *
-		 * If we are forced to "start over" below, we keep the tuple lock;
-		 * this arranges that we stay at the head of the line while rechecking
-		 * tuple state.
-		 */
-		if (infomask & HEAP_XMAX_IS_MULTI)
-		{
-			bool		current_is_member = false;
-
-			if (DoesMultiXactIdConflict((MultiXactId) xwait, infomask,
-										LockTupleExclusive, &current_is_member))
-			{
-				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-
-				/*
-				 * Acquire the lock, if necessary (but skip it when we're
-				 * requesting a lock and already have one; avoids deadlock).
-				 */
-				if (!current_is_member)
-					heap_acquire_tuplock(relation, &(tp.t_self), LockTupleExclusive,
-										 LockWaitBlock, &have_tuple_lock);
-
-				/* wait for multixact */
-				MultiXactIdWait((MultiXactId) xwait, MultiXactStatusUpdate, infomask,
-								relation, &(tp.t_self), XLTW_Delete,
-								NULL);
-				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
-
-				/*
-				 * If xwait had just locked the tuple then some other xact
-				 * could update this tuple before we get to this point.  Check
-				 * for xmax change, and start over if so.
-				 */
-				if (xmax_infomask_changed(tp.t_data->t_infomask, infomask) ||
-					!TransactionIdEquals(HeapTupleHeaderGetRawXmax(tp.t_data),
-										 xwait))
-					goto l1;
-			}
-
-			/*
-			 * You might think the multixact is necessarily done here, but not
-			 * so: it could have surviving members, namely our own xact or
-			 * other subxacts of this backend.  It is legal for us to delete
-			 * the tuple in either case, however (the latter case is
-			 * essentially a situation of upgrading our former shared lock to
-			 * exclusive).  We don't bother changing the on-disk hint bits
-			 * since we are about to overwrite the xmax altogether.
-			 */
-		}
-		else if (!TransactionIdIsCurrentTransactionId(xwait))
+		if (!TransactionIdIsCurrentTransactionId(xwait))
 		{
 			/*
 			 * Wait for regular transaction to end; but first, acquire tuple
@@ -2533,13 +2150,12 @@ l1:
 			 * other xact could update this tuple before we get to this point.
 			 * Check for xmax change, and start over if so.
 			 */
-			if (xmax_infomask_changed(tp.t_data->t_infomask, infomask) ||
-				!TransactionIdEquals(HeapTupleHeaderGetRawXmax(tp.t_data),
+			if (!TransactionIdEquals(HeapTupleHeaderGetRawXmin(tp.t_data),
 									 xwait))
 				goto l1;
 
 			/* Otherwise check if it committed or aborted */
-			UpdateXmaxHintBits(tp.t_data, buffer, xwait);
+			UpdateXminHintBits(tp.t_data, buffer, xwait);
 		}
 
 		/*
@@ -2547,7 +2163,6 @@ l1:
 		 * only locked the tuple without updating it.
 		 */
 		if ((tp.t_data->t_infomask & HEAP_XMAX_INVALID) ||
-			HEAP_XMAX_IS_LOCKED_ONLY(tp.t_data->t_infomask) ||
 			HeapTupleHeaderIsOnlyLocked(tp.t_data))
 			result = TM_Ok;
 		else if (!ItemPointerEquals(&tp.t_self, &tp.t_data->t_ctid) ||
@@ -2569,8 +2184,8 @@ l1:
 		Assert(result == TM_SelfModified ||
 			   result == TM_Updated ||
 			   result == TM_Deleted ||
-			   result == TM_BeingModified);
-		Assert(!(tp.t_data->t_infomask & HEAP_XMAX_INVALID));
+			   result == TM_Invisible);
+		Assert(!(tp.t_data->t_infomask & HEAP_XMIN_INVALID));
 		Assert(result != TM_Updated ||
 			   !ItemPointerEquals(&tp.t_self, &tp.t_data->t_ctid));
 		tmfd->ctid = tp.t_data->t_ctid;
@@ -2687,11 +2302,11 @@ undam_relation_nontransactional_truncate(Relation rel)
     /* Do the real work to truncate relation forks */
 	smgrtruncate(rel->rd_smgr, forks, 2, blocks);
 
-	for (int chain = 0; chain < UndamNAllocChains; chain++)
+	for (int fork = MAIN_FORKNUM; fork <= EXT_FORKNUM; fork++)
 	{
-		for (int fork = MAIN_FORKNUM; fork <= EXT_FORKNUM; fork++)
+		for (int chain = 0; chain < UndamNAllocChains; chain++)
 		{
-			Buffer buf = ReadBufferExtended(rel, fork, P_NEW, RBM_NORMAL, NULL);
+			Buffer buf = UndamReadBuffer(rel, fork, P_NEW);
 			UndamPageHeader* pg;
 			GenericXLogState* xlogState = GenericXLogStart(rel);
 
@@ -2718,7 +2333,7 @@ undam_relation_set_new_filenode(Relation rel,
 								 MultiXactId *minmulti)
 {
 	SMgrRelation srel;
-
+	SMgrRelationData* old_smgr;
 	/*
 	 * Initialize to the minimum XID that could put tuples in the table. We
 	 * know that no xacts older than RecentXmin are still running, so that
@@ -2739,9 +2354,12 @@ undam_relation_set_new_filenode(Relation rel,
 	srel = RelationCreateStorage(*newrnode, persistence);
 	smgrcreate(srel, EXT_FORKNUM, false);
 	log_smgrcreate(newrnode, EXT_FORKNUM);
-	smgrclose(srel);
 
+	old_smgr = rel->rd_smgr;
+	rel->rd_smgr = srel;
 	undam_relation_nontransactional_truncate(rel);
+	rel->rd_smgr = old_smgr;
+	smgrclose(srel);
 }
 
 static void
@@ -2792,7 +2410,7 @@ undam_scan_analyze_next_block(TableScanDesc scan, BlockNumber blockno,
 	if (blockno >= uscan->lastBlock)
 		return false;
 
-	ItemPointerSet(&uscan->currItem, blockno, 0); /* will be incremented by analyze_next_tuple */
+	ItemPointerSet(&uscan->currItem, blockno, 1);
     return true;
 }
 
@@ -2804,10 +2422,10 @@ undam_scan_analyze_next_tuple(TableScanDesc scan, TransactionId OldestXmin,
     Relation      rel = scan->rs_rd;
 	UndamRelationInfo* relinfo = UndamGetRelationInfo(rel);
     UndamScanDesc uscan = (UndamScanDesc) scan;
-	int           item = ItemPointerGetOffsetNumber(&uscan->currItem) + 1;
+	int           item = ItemPointerGetOffsetNumber(&uscan->currItem);
 	BlockNumber   blocknum = ItemPointerGetBlockNumber(&uscan->currItem);
 	int           nChunks = CHUNKS_PER_BLOCK;
-	Buffer        buf = ReadBufferExtended(rel, MAIN_FORKNUM, blocknum, RBM_NORMAL, NULL);
+	Buffer        buf = UndamReadBuffer(rel, MAIN_FORKNUM, blocknum);
 	UndamPageHeader* pg = (UndamPageHeader*)BufferGetPage(buf);
 
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
@@ -2818,7 +2436,7 @@ undam_scan_analyze_next_tuple(TableScanDesc scan, TransactionId OldestXmin,
 		{
 			UndamTupleHeader* tup = (UndamTupleHeader*)((char*)pg + item*CHUNK_SIZE);
 			HeapTupleData tuphdr;
-			int len = HeapTupleHeaderGetDatumLength(&tup->hdr);
+			int len = tup->size;
 			bool sample_it = false;
 
 			tuphdr.t_tableOid = RelationGetRelid(rel);
@@ -2928,7 +2546,7 @@ undam_scan_analyze_next_tuple(TableScanDesc scan, TransactionId OldestXmin,
 					do {
 						Assert(next != INVALID_POSITION);
 						UnlockReleaseBuffer(buf);
-						buf = ReadBufferExtended(rel, EXT_FORKNUM, POSITION_GET_BLOCK_NUMBER(next), RBM_NORMAL, NULL);
+						buf = UndamReadBuffer(rel, EXT_FORKNUM, POSITION_GET_BLOCK_NUMBER(next));
 						pg = (UndamPageHeader*)BufferGetPage(buf);
 						chunk = (UndamTupleChunk*)((char*)pg + POSITION_GET_BLOCK_OFFSET(next));
 						LockBuffer(buf, BUFFER_LOCK_SHARE);
@@ -2940,6 +2558,7 @@ undam_scan_analyze_next_tuple(TableScanDesc scan, TransactionId OldestXmin,
 				}
 				ExecStoreHeapTuple(tuple, slot, true);
 				UnlockReleaseBuffer(buf);
+				ItemPointerSetOffsetNumber(&uscan->currItem, item+1);
 				return true;
 			}
 		}

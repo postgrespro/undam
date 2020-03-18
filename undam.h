@@ -55,7 +55,8 @@ typedef struct
 {
 	UndamPosition nextChunk; /* L1-list of extension chunks */
 	UndamPosition undoChain; /* L1-list of undo versions */
-	HeapTupleHeaderData hdr;
+	uint32        size;       /* Length of the tuple */
+ 	HeapTupleHeaderData hdr;
 } UndamTupleHeader;
 
 /*
