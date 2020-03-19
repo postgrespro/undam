@@ -178,8 +178,8 @@ UndamWriteData(Relation rel, int forknum, char* data, uint32 size, UndamPosition
 		if (blocknum == InvalidBlockNumber) /* Allocation chain is empty */
 		{
 			chainBuf = UndamReadBuffer(rel, forknum, chainNo);
-			chain = (UndamPageHeader*)GenericXLogRegisterBuffer(xlogState, chainBuf, 0);
 			LockBuffer(chainBuf, BUFFER_LOCK_EXCLUSIVE);
+			chain = (UndamPageHeader*)GenericXLogRegisterBuffer(xlogState, chainBuf, 0);
 			if (chain->head == InvalidBlockNumber) /* extend chain */
 			{
 				Assert(relinfo->chains[chainNo].forks[forknum].tail == chain->tail);
@@ -266,7 +266,6 @@ UndamWriteData(Relation rel, int forknum, char* data, uint32 size, UndamPosition
 			{
 				relinfo->chains[chainNo].forks[forknum].head = chain->head = nextFree;
 			}
-			item = CHUNKS_PER_BLOCK;
 		}
 		GenericXLogFinish(xlogState);
 		UnlockReleaseBuffer(buf);
@@ -318,11 +317,16 @@ UndamUpdateTuple(Relation rel, HeapTuple tuple, Buffer buffer)
 	UndamPageHeader* pg = (UndamPageHeader*)GenericXLogRegisterBuffer(xlogState, buffer, 0);
 	UndamTupleHeader* old = (UndamTupleHeader*)((char*)pg + offs);
 	int len = Min(old->size, available);
+	UndamPosition undo = old->undoChain;
 	Assert(len > 0);
 
 	/* Create copy of head chunk */
 	old->undoChain = UndamWriteData(rel, EXT_FORKNUM, (char*)&old->hdr, len, old->undoChain, old->size, old->nextChunk);
-
+	elog(LOG, "Create undo version %d.%d of %d.%d after %d.%d for relation %d",
+		 POSITION_GET_BLOCK_NUMBER(old->undoChain), POSITION_GET_ITEM(old->undoChain),
+		 ItemPointerGetBlockNumber(&tuple->t_self), ItemPointerGetOffsetNumber(&tuple->t_self),
+		 POSITION_GET_BLOCK_NUMBER(undo), POSITION_GET_ITEM(undo),
+		 relinfo->reloid);
 	len = Min(tuple->t_len, available);
 	memcpy(&old->hdr, tuple->t_data, len); /* in-place update of head chunk */
 	old->hdr.t_ctid = tuple->t_self;
@@ -434,12 +438,15 @@ UndamDeleteTuple(Relation rel, UndamPosition pos, UndamPosition undo)
 	{
 		Buffer buf = UndamReadBuffer(rel, EXT_FORKNUM, blocknum);
 		GenericXLogState* xlogState = GenericXLogStart(rel);
-		UndamPageHeader* pg = (UndamPageHeader*)GenericXLogRegisterBuffer(xlogState, buf, 0);
+		UndamPageHeader* pg;
 		Buffer chainBuf = InvalidBuffer;
 		UndamPosition next;
 
-		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		Assert(item > 0 && item < CHUNKS_PER_BLOCK);
 
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		pg = (UndamPageHeader*)GenericXLogRegisterBuffer(xlogState, buf, 0);
+		elog(LOG, "Delete tuple %d.%d of relation %d", blocknum, item, relinfo->reloid);
 		Assert(pg->allocMask[item >> 6] & ((uint64)1 << (item & 63)));
 		pg->allocMask[item >> 6] &= ~((uint64)1 << (item & 63));
 
@@ -456,6 +463,7 @@ UndamDeleteTuple(Relation rel, UndamPosition pos, UndamPosition undo)
 			next = hdr->nextChunk;
 			Assert(undo != 0 && next != 0); /* 0 is not valid position value */
 		}
+		memset((char*)pg + item*CHUNK_SIZE, 0xDE, CHUNK_SIZE);
 		if (pg->pd_flags & PD_PAGE_FULL) /* page was full: include it in allocation chain  */
 		{
 			int chainNo = blocknum % N_ALLOC_CHAINS;
@@ -488,6 +496,8 @@ UndamDeleteTuple(Relation rel, UndamPosition pos, UndamPosition undo)
 		{
 			if (undo == INVALID_POSITION)
 				break;
+			elog(LOG, "Delete undo version %d.%d of relation %d",
+				 POSITION_GET_BLOCK_NUMBER(undo), POSITION_GET_ITEM(undo), relinfo->reloid);
 			next = undo;
 			undo = 0; /* Start with head chunk */
 		}
@@ -1958,6 +1968,7 @@ undam_relation_vacuum(Relation rel,
 					TransactionId xmin = HeapTupleHeaderGetRawXmin(&tup->hdr);
 					if (TransactionIdPrecedes(xmin, oldestXmin)) /* Tuple is visible for everybody */
 					{
+						nVisibleForAllTuples += nVisible;
 						if (xlogState == NULL)
 						{
 							/* Retry scan of page under execlusive lock */
@@ -1965,12 +1976,8 @@ undam_relation_vacuum(Relation rel,
 							LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 							xlogState = GenericXLogStart(rel);
 							pg = (UndamPageHeader*)GenericXLogRegisterBuffer(xlogState, buf, 0);
-							chunk = 0; /* will be incremented by for */
-							nVersions = 0;
-							nVisible = 0;
-							continue;
+							Assert(pg->allocMask[chunk >> 6] & ((uint64)1 << (chunk & 63)));
 						}
-						nVisible += 1;
 						tuple.t_data = &tup->hdr;
 						tuple.t_len =  tup->size;
 						if (HeapTupleSatisfiesVacuum(&tuple, oldestXmin, buf) == HEAPTUPLE_DEAD)
@@ -1990,6 +1997,8 @@ undam_relation_vacuum(Relation rel,
 						}
 						if (tup->undoChain != INVALID_POSITION)
 						{
+							elog(LOG, "Delete undo chain for %d.%d of relation %d",
+								 block, chunk, relinfo->reloid);
 							/* We do not need undo chain any more */
 							UndamDeleteTuple(rel, tup->undoChain, 0);
 							tup->undoChain = INVALID_POSITION;
@@ -2004,31 +2013,37 @@ undam_relation_vacuum(Relation rel,
 							Buffer vbuf = UndamReadBuffer(rel, EXT_FORKNUM, POSITION_GET_BLOCK_NUMBER(undo));
 							UndamPageHeader* vpg = (UndamPageHeader*)BufferGetPage(vbuf);
 							UndamTupleHeader* ver;
-
+							int offs = POSITION_GET_BLOCK_OFFSET(undo);
+							UndamPosition prev = undo;
 							LockBuffer(vbuf, BUFFER_LOCK_SHARE);
-							nVersions += 1;
-							ver = (UndamTupleHeader*)((char*)vpg + POSITION_GET_BLOCK_OFFSET(undo));
+							nUndoVersions += 1;
+							ver = (UndamTupleHeader*)((char*)vpg + offs);
 							Assert(ver->undoChain != 0);
+							undo = ver->undoChain;
 
 							if (TransactionIdPrecedes(HeapTupleHeaderGetRawXmin(&ver->hdr), oldestXmin)) /* Tuple is visible for everybody */
 							{
-								if (ver->undoChain != INVALID_POSITION)
+								if (undo != INVALID_POSITION)
 								{
 									GenericXLogState* vxlogState = GenericXLogStart(rel);
 									LockBuffer(vbuf, BUFFER_LOCK_UNLOCK);
 									LockBuffer(vbuf, BUFFER_LOCK_EXCLUSIVE);
 									vpg = (UndamPageHeader*)GenericXLogRegisterBuffer(vxlogState, vbuf, 0);
-									ver = (UndamTupleHeader*)((char*)vpg + POSITION_GET_BLOCK_OFFSET(undo));
-									Assert(ver->undoChain != INVALID_POSITION && ver->undoChain != 0);
-									UndamDeleteTuple(rel, ver->undoChain, 0); /* delete rest of chain */
+									ver = (UndamTupleHeader*)((char*)vpg + offs);
+									Assert(ver->undoChain == undo);
 									ver->undoChain = INVALID_POSITION;
 									GenericXLogFinish(vxlogState);
 									nTruncatedUndoChains += 1;
-								}
-								UnlockReleaseBuffer(vbuf);
+									UnlockReleaseBuffer(vbuf);
+									elog(LOG, "Delete undo chain %d.%d for version %d.%d of %d.%d of relation %d",
+										 POSITION_GET_BLOCK_NUMBER(undo), POSITION_GET_ITEM(undo),
+										 POSITION_GET_BLOCK_NUMBER(prev), POSITION_GET_ITEM(prev),
+										 block, chunk, relinfo->reloid);
+									UndamDeleteTuple(rel, undo, 0); /* delete rest of chain */
+								} else
+									UnlockReleaseBuffer(vbuf);
 								break;
 							}
-							undo = ver->undoChain;
 							UnlockReleaseBuffer(vbuf);
 						}
 					}
@@ -2036,7 +2051,6 @@ undam_relation_vacuum(Relation rel,
 			}
 		}
 		nDeadTuples += nDeleted;
-		nVisibleForAllTuples += nVisible;
 		nUndoVersions += nVersions;
 
 		if (nDeleted != 0 && (pg->pd_flags & PD_PAGE_FULL))  /* page was full: include it in allocation chain  */
