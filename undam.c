@@ -57,6 +57,38 @@ static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 
 static uint64 UndamDeleteTuple(Relation rel, UndamPosition pos, UndamPosition undo);
 
+static Page
+UndamModifyBuffer(Relation rel, GenericXLogState* state, Buffer buf)
+{
+	Page pg;
+	if (RelationNeedsWAL(rel))
+	{
+		pg = GenericXLogRegisterBuffer(state, buf, 0);
+	}
+	else
+	{
+		MarkBufferDirty(buf);
+		pg = BufferGetPage(buf);
+	}
+	return pg;
+}
+
+static void
+UndamXLogFinish(Relation rel, GenericXLogState* state)
+{
+	if (state)
+	{
+		if (RelationNeedsWAL(rel))
+		{
+			GenericXLogFinish(state);
+		}
+		else
+		{
+			pfree(state);
+		}
+	}
+}
+
 /*
  * Read and if necesary intialize new page. We have to switch on zero_damahged_pages to allow
  * reading beyond end of file. Alternatively we have to use relation extension lock which
@@ -179,7 +211,7 @@ UndamWriteData(Relation rel, int forknum, char* data, uint32 size, UndamPosition
 		{
 			chainBuf = UndamReadBuffer(rel, forknum, chainNo);
 			LockBuffer(chainBuf, BUFFER_LOCK_EXCLUSIVE);
-			chain = (UndamPageHeader*)GenericXLogRegisterBuffer(xlogState, chainBuf, 0);
+			chain = (UndamPageHeader*)UndamModifyBuffer(rel, xlogState, chainBuf);
 			if (chain->head == InvalidBlockNumber) /* extend chain */
 			{
 				Assert(relinfo->chains[chainNo].forks[forknum].tail == chain->tail);
@@ -193,7 +225,7 @@ UndamWriteData(Relation rel, int forknum, char* data, uint32 size, UndamPosition
 		}
 		buf = UndamReadBuffer(rel, forknum, blocknum);
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-		pg = (UndamPageHeader*)GenericXLogRegisterBuffer(xlogState, buf, 0);
+		pg = (UndamPageHeader*)UndamModifyBuffer(rel, xlogState, buf);
 
 		if (PageIsNew(pg)) /* Lazy initialization of the page */
 		{
@@ -253,7 +285,7 @@ UndamWriteData(Relation rel, int forknum, char* data, uint32 size, UndamPosition
 					/* Locate block with chain header */
 					chainBuf = UndamReadBuffer(rel, forknum, chainNo);
 					LockBuffer(chainBuf, BUFFER_LOCK_EXCLUSIVE);
-					chain = (UndamPageHeader*)GenericXLogRegisterBuffer(xlogState, chainBuf, 0);
+					chain = (UndamPageHeader*)UndamModifyBuffer(rel, xlogState, chainBuf);
 				}
 			}
 			else
@@ -267,7 +299,7 @@ UndamWriteData(Relation rel, int forknum, char* data, uint32 size, UndamPosition
 				relinfo->chains[chainNo].forks[forknum].head = chain->head = nextFree;
 			}
 		}
-		GenericXLogFinish(xlogState);
+		UndamXLogFinish(rel, xlogState);
 		UnlockReleaseBuffer(buf);
 		if (chainBuf)
 			UnlockReleaseBuffer(chainBuf);
@@ -314,7 +346,7 @@ UndamUpdateTuple(Relation rel, HeapTuple tuple, Buffer buffer)
 	int offs = tuple->t_self.ip_posid*CHUNK_SIZE;
 	int available = CHUNK_SIZE - offsetof(UndamTupleHeader, hdr);
 	GenericXLogState* xlogState = GenericXLogStart(rel);
-	UndamPageHeader* pg = (UndamPageHeader*)GenericXLogRegisterBuffer(xlogState, buffer, 0);
+	UndamPageHeader* pg = (UndamPageHeader*)UndamModifyBuffer(rel, xlogState, buffer);
 	UndamTupleHeader* old = (UndamTupleHeader*)((char*)pg + offs);
 	int len = Min(old->size, available);
 	UndamPosition undo = old->undoChain;
@@ -348,7 +380,7 @@ UndamUpdateTuple(Relation rel, HeapTuple tuple, Buffer buffer)
 	}
 	else
 		old->nextChunk = INVALID_POSITION;
-	GenericXLogFinish(xlogState);
+	UndamXLogFinish(rel, xlogState);
 	UnlockReleaseBuffer(buffer);
 }
 
@@ -457,7 +489,7 @@ UndamDeleteTuple(Relation rel, UndamPosition pos, UndamPosition undo)
 		Assert(item > 0 && item < CHUNKS_PER_BLOCK);
 
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-		pg = (UndamPageHeader*)GenericXLogRegisterBuffer(xlogState, buf, 0);
+		pg = (UndamPageHeader*)UndamModifyBuffer(rel, xlogState, buf);
 		Assert(pg->allocMask[item >> 6] & ((uint64)1 << (item & 63)));
 		pg->allocMask[item >> 6] &= ~((uint64)1 << (item & 63));
 		nDeletedChunks += 1;
@@ -487,7 +519,7 @@ UndamDeleteTuple(Relation rel, UndamPosition pos, UndamPosition undo)
 			{
 				chainBuf = UndamReadBuffer(rel, EXT_FORKNUM, chainNo);
 				LockBuffer(chainBuf, BUFFER_LOCK_EXCLUSIVE);
-				chain = (UndamPageHeader*)GenericXLogRegisterBuffer(xlogState, chainBuf, 0);
+				chain = (UndamPageHeader*)UndamModifyBuffer(rel, xlogState, chainBuf);
 				Assert(chain->head == relinfo->chains[chainNo].forks[EXT_FORKNUM].head);
 			}
 			else
@@ -499,7 +531,7 @@ UndamDeleteTuple(Relation rel, UndamPosition pos, UndamPosition undo)
 			chain->head = blocknum;
 			relinfo->chains[chainNo].forks[EXT_FORKNUM].head = blocknum;
 		}
-		GenericXLogFinish(xlogState);
+		UndamXLogFinish(rel, xlogState);
 		if (chainBuf)
 			UnlockReleaseBuffer(chainBuf);
 		UnlockReleaseBuffer(buf);
@@ -1430,7 +1462,6 @@ static bool
 undam_tuple_tid_valid(TableScanDesc scan, ItemPointer tid)
 {
 	UndamScanDesc uscan = (UndamScanDesc)scan;
-	UndamRelationInfo* relinfo = UndamGetRelationInfo(scan->rs_rd);
 	int item = ItemPointerGetOffsetNumber(&uscan->currItem);
 	BlockNumber   blocknum = ItemPointerGetBlockNumber(&uscan->currItem);
 	Buffer buf = UndamReadBuffer(scan->rs_rd, MAIN_FORKNUM, blocknum);
@@ -1985,7 +2016,7 @@ undam_relation_vacuum(Relation rel,
 							LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 							LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 							xlogState = GenericXLogStart(rel);
-							pg = (UndamPageHeader*)GenericXLogRegisterBuffer(xlogState, buf, 0);
+							pg = (UndamPageHeader*)UndamModifyBuffer(rel, xlogState, buf);
 							tup = (UndamTupleHeader*)((char*)pg + chunk*CHUNK_SIZE);
 							Assert(pg->allocMask[chunk >> 6] & ((uint64)1 << (chunk & 63)));
 						}
@@ -2036,11 +2067,11 @@ undam_relation_vacuum(Relation rel,
 									GenericXLogState* vxlogState = GenericXLogStart(rel);
 									LockBuffer(vbuf, BUFFER_LOCK_UNLOCK);
 									LockBuffer(vbuf, BUFFER_LOCK_EXCLUSIVE);
-									vpg = (UndamPageHeader*)GenericXLogRegisterBuffer(vxlogState, vbuf, 0);
+									vpg = (UndamPageHeader*)UndamModifyBuffer(rel, vxlogState, vbuf);
 									ver = (UndamTupleHeader*)((char*)vpg + offs);
 									Assert(ver->undoChain == undo);
 									ver->undoChain = INVALID_POSITION;
-									GenericXLogFinish(vxlogState);
+									UndamXLogFinish(rel, vxlogState);
 									nTruncatedUndoChains += 1;
 									UnlockReleaseBuffer(vbuf);
 									nDeletedVersions += UndamDeleteTuple(rel, undo, 0); /* delete rest of chain */
@@ -2068,7 +2099,7 @@ undam_relation_vacuum(Relation rel,
 			{
 				chainBuf = UndamReadBuffer(rel, MAIN_FORKNUM, chainNo);
 				LockBuffer(chainBuf, BUFFER_LOCK_EXCLUSIVE);
-				chain = (UndamPageHeader*)GenericXLogRegisterBuffer(xlogState, chainBuf, 0);
+				chain = (UndamPageHeader*)UndamModifyBuffer(rel, xlogState, chainBuf);
 				Assert(chain->head == relinfo->chains[chainNo].forks[MAIN_FORKNUM].head);
 			}
 			else
@@ -2080,8 +2111,7 @@ undam_relation_vacuum(Relation rel,
 			chain->head = block;
 			relinfo->chains[chainNo].forks[MAIN_FORKNUM].head = block;
 		}
-		if (xlogState)
-			GenericXLogFinish(xlogState);
+		UndamXLogFinish(rel, xlogState);
 		UnlockReleaseBuffer(buf);
 		if (chainBuf)
 			UnlockReleaseBuffer(chainBuf);
@@ -2228,7 +2258,7 @@ l1:
 	CheckForSerializableConflictIn(relation, tid, BufferGetBlockNumber(buffer));
 
 	xlogState = GenericXLogStart(relation);
-	page = GenericXLogRegisterBuffer(xlogState, buffer, 0);
+	page = UndamModifyBuffer(relation, xlogState, buffer);
 	tup = (UndamTupleHeader*)((char*)page + ItemPointerGetOffsetNumber(tid)*CHUNK_SIZE);
 	tp.t_data = &tup->hdr;
 
@@ -2278,7 +2308,7 @@ l1:
 
 	END_CRIT_SECTION();
 
-	GenericXLogFinish(xlogState);
+	UndamXLogFinish(relation, xlogState);
 	UnlockReleaseBuffer(buffer);
 
 	/*
@@ -2328,7 +2358,7 @@ undam_relation_nontransactional_truncate(Relation rel)
 			GenericXLogState* xlogState = GenericXLogStart(rel);
 
 			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-			pg = (UndamPageHeader*)GenericXLogRegisterBuffer(xlogState, buf, 0);
+			pg = (UndamPageHeader*)UndamModifyBuffer(rel, xlogState, buf);
 			pg->chunkSize = UndamChunkSize;
 			pg->nChains = UndamNAllocChains;
 			relinfo->chains[chain].forks[fork].head = pg->head = chain;
@@ -2336,7 +2366,7 @@ undam_relation_nontransactional_truncate(Relation rel)
 			pg->next = InvalidBlockNumber;
 			pg->pd_special = pg->pd_lower = pg->pd_upper = sizeof(UndamPageHeader);
 
-			GenericXLogFinish(xlogState);
+			UndamXLogFinish(rel, xlogState);
 			UnlockReleaseBuffer(buf);
 		}
 	}
