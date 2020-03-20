@@ -51,11 +51,11 @@ static relopt_kind UndamReloptKind;
 
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 
-
-
 /********************************************************************
  * Main Undam functions
  ********************************************************************/
+
+static uint64 UndamDeleteTuple(Relation rel, UndamPosition pos, UndamPosition undo);
 
 /*
  * Read and if necesary intialize new page. We have to switch on zero_damahged_pages to allow
@@ -318,15 +318,25 @@ UndamUpdateTuple(Relation rel, HeapTuple tuple, Buffer buffer)
 	UndamTupleHeader* old = (UndamTupleHeader*)((char*)pg + offs);
 	int len = Min(old->size, available);
 	UndamPosition undo = old->undoChain;
+	UndamPosition truncateChain = INVALID_POSITION;
 	Assert(len > 0);
 
+	if (undo != INVALID_POSITION)
+	{
+		if (HeapTupleHeaderXminFrozen(&old->hdr)
+			|| TransactionIdPrecedes(HeapTupleHeaderGetRawXmin(&old->hdr), RecentGlobalXmin))
+		{
+			/* Updated version is visible for everybody: truncate its undo chain */
+			truncateChain = undo;
+			undo = INVALID_POSITION;
+		}
+	}
 	/* Create copy of head chunk */
-	old->undoChain = UndamWriteData(rel, EXT_FORKNUM, (char*)&old->hdr, len, old->undoChain, old->size, old->nextChunk);
-	elog(LOG, "Create undo version %d.%d of %d.%d after %d.%d for relation %d",
-		 POSITION_GET_BLOCK_NUMBER(old->undoChain), POSITION_GET_ITEM(old->undoChain),
-		 ItemPointerGetBlockNumber(&tuple->t_self), ItemPointerGetOffsetNumber(&tuple->t_self),
-		 POSITION_GET_BLOCK_NUMBER(undo), POSITION_GET_ITEM(undo),
-		 relinfo->reloid);
+	old->undoChain = UndamWriteData(rel, EXT_FORKNUM, (char*)&old->hdr, len, undo, old->size, old->nextChunk);
+	if (truncateChain != INVALID_POSITION)
+	{
+		UndamDeleteTuple(rel, truncateChain, 0);
+	}
 	len = Min(tuple->t_len, available);
 	memcpy(&old->hdr, tuple->t_data, len); /* in-place update of head chunk */
 	old->hdr.t_ctid = tuple->t_self;
@@ -426,13 +436,15 @@ UndamReadTuple(Relation rel, Snapshot snapshot, ItemPointer ip)
 
 /*
  * Delete unused version of the tuple from extension fork.
+ * If undo is 0, then we delete undo chain from the first (head) chunk.
  */
-static void
+static uint64
 UndamDeleteTuple(Relation rel, UndamPosition pos, UndamPosition undo)
 {
 	UndamRelationInfo* relinfo = UndamGetRelationInfo(rel);
 	BlockNumber blocknum = POSITION_GET_BLOCK_NUMBER(pos);
 	int item = POSITION_GET_ITEM(pos);
+	uint64 nDeletedChunks = 0;
 
 	while (true)
 	{
@@ -446,9 +458,9 @@ UndamDeleteTuple(Relation rel, UndamPosition pos, UndamPosition undo)
 
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 		pg = (UndamPageHeader*)GenericXLogRegisterBuffer(xlogState, buf, 0);
-		elog(LOG, "Delete tuple %d.%d of relation %d", blocknum, item, relinfo->reloid);
 		Assert(pg->allocMask[item >> 6] & ((uint64)1 << (item & 63)));
 		pg->allocMask[item >> 6] &= ~((uint64)1 << (item & 63));
+		nDeletedChunks += 1;
 
 		if (undo) /* not first chunk */
 		{
@@ -496,14 +508,13 @@ UndamDeleteTuple(Relation rel, UndamPosition pos, UndamPosition undo)
 		{
 			if (undo == INVALID_POSITION)
 				break;
-			elog(LOG, "Delete undo version %d.%d of relation %d",
-				 POSITION_GET_BLOCK_NUMBER(undo), POSITION_GET_ITEM(undo), relinfo->reloid);
 			next = undo;
 			undo = 0; /* Start with head chunk */
 		}
 		blocknum = POSITION_GET_BLOCK_NUMBER(next);
 		item = POSITION_GET_ITEM(next);
 	}
+	return nDeletedChunks;
 }
 
 /********************************************************************
@@ -1929,6 +1940,7 @@ undam_relation_vacuum(Relation rel,
 	uint64  nFrozenTuples = 0;
 	uint64  nTruncatedUndoChains = 0;
 	uint64  nUndoVersions = 0;
+	uint64  nDeletedVersions = 0;
 	TransactionId oldestXmin;
 	TransactionId freezeLimit;
 	MultiXactId   multiXactCutoff;
@@ -1945,15 +1957,13 @@ undam_relation_vacuum(Relation rel,
 						  NULL,
 						  &multiXactCutoff,
 						  NULL);
-	elog(LOG, "UNDAM: vacuum of relation %d started", RelationGetRelid(rel));
+	elog(LOG, "UNDAM: vacuum of relation %s started", RelationGetRelationName(rel));
 	for (BlockNumber block = 0; block < lastBlock; block++)
 	{
 		Buffer buf = UndamReadBuffer(rel, MAIN_FORKNUM, block);
 		UndamPageHeader* pg = (UndamPageHeader*)BufferGetPage(buf);
 		GenericXLogState* xlogState = NULL;
 		int nDeleted = 0;
-		int nVersions = 0;
-		int nVisible = 0;
 		Buffer chainBuf = InvalidBuffer;
 
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
@@ -1968,7 +1978,7 @@ undam_relation_vacuum(Relation rel,
 					TransactionId xmin = HeapTupleHeaderGetRawXmin(&tup->hdr);
 					if (TransactionIdPrecedes(xmin, oldestXmin)) /* Tuple is visible for everybody */
 					{
-						nVisibleForAllTuples += nVisible;
+						nVisibleForAllTuples += 1;
 						if (xlogState == NULL)
 						{
 							/* Retry scan of page under execlusive lock */
@@ -1976,6 +1986,7 @@ undam_relation_vacuum(Relation rel,
 							LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 							xlogState = GenericXLogStart(rel);
 							pg = (UndamPageHeader*)GenericXLogRegisterBuffer(xlogState, buf, 0);
+							tup = (UndamTupleHeader*)((char*)pg + chunk*CHUNK_SIZE);
 							Assert(pg->allocMask[chunk >> 6] & ((uint64)1 << (chunk & 63)));
 						}
 						tuple.t_data = &tup->hdr;
@@ -1987,7 +1998,7 @@ undam_relation_vacuum(Relation rel,
 							deadBitmap[pos >> 6] |= (uint64)1 << (pos & 63);
 							nDeleted += 1;
 							if (tup->nextChunk != INVALID_POSITION)
-								UndamDeleteTuple(rel, tup->nextChunk, INVALID_POSITION); /* delete tuple tail */
+								nDeletedVersions += UndamDeleteTuple(rel, tup->nextChunk, INVALID_POSITION); /* delete tuple tail */
 						}
 						else if (TransactionIdPrecedes(xmin, freezeLimit))
 						{
@@ -1997,10 +2008,8 @@ undam_relation_vacuum(Relation rel,
 						}
 						if (tup->undoChain != INVALID_POSITION)
 						{
-							elog(LOG, "Delete undo chain for %d.%d of relation %d",
-								 block, chunk, relinfo->reloid);
 							/* We do not need undo chain any more */
-							UndamDeleteTuple(rel, tup->undoChain, 0);
+							nDeletedVersions += UndamDeleteTuple(rel, tup->undoChain, 0);
 							tup->undoChain = INVALID_POSITION;
 							nTruncatedUndoChains += 1;
 						}
@@ -2014,7 +2023,6 @@ undam_relation_vacuum(Relation rel,
 							UndamPageHeader* vpg = (UndamPageHeader*)BufferGetPage(vbuf);
 							UndamTupleHeader* ver;
 							int offs = POSITION_GET_BLOCK_OFFSET(undo);
-							UndamPosition prev = undo;
 							LockBuffer(vbuf, BUFFER_LOCK_SHARE);
 							nUndoVersions += 1;
 							ver = (UndamTupleHeader*)((char*)vpg + offs);
@@ -2035,11 +2043,7 @@ undam_relation_vacuum(Relation rel,
 									GenericXLogFinish(vxlogState);
 									nTruncatedUndoChains += 1;
 									UnlockReleaseBuffer(vbuf);
-									elog(LOG, "Delete undo chain %d.%d for version %d.%d of %d.%d of relation %d",
-										 POSITION_GET_BLOCK_NUMBER(undo), POSITION_GET_ITEM(undo),
-										 POSITION_GET_BLOCK_NUMBER(prev), POSITION_GET_ITEM(prev),
-										 block, chunk, relinfo->reloid);
-									UndamDeleteTuple(rel, undo, 0); /* delete rest of chain */
+									nDeletedVersions += UndamDeleteTuple(rel, undo, 0); /* delete rest of chain */
 								} else
 									UnlockReleaseBuffer(vbuf);
 								break;
@@ -2051,7 +2055,6 @@ undam_relation_vacuum(Relation rel,
 			}
 		}
 		nDeadTuples += nDeleted;
-		nUndoVersions += nVersions;
 
 		if (nDeleted != 0 && (pg->pd_flags & PD_PAGE_FULL))  /* page was full: include it in allocation chain  */
 		{
@@ -2083,8 +2086,8 @@ undam_relation_vacuum(Relation rel,
 		if (chainBuf)
 			UnlockReleaseBuffer(chainBuf);
 	}
-	elog(LOG, "UNDAM: vacuum of relation %d completed: " UINT64_FORMAT " visible for all tuples, " UINT64_FORMAT " dead tuples, " UINT64_FORMAT " frozen tuples, " UINT64_FORMAT " truncated UNDO chains, " UINT64_FORMAT " UNDO versions",
-		 RelationGetRelid(rel), nVisibleForAllTuples, nDeadTuples, nFrozenTuples, nTruncatedUndoChains, nUndoVersions);
+	elog(LOG, "UNDAM: vacuum of relation %s completed: " UINT64_FORMAT " visible for all tuples, " UINT64_FORMAT " dead tuples, " UINT64_FORMAT " frozen tuples, " UINT64_FORMAT " truncated UNDO chains, " UINT64_FORMAT " UNDO versions, " UINT64_FORMAT " deleted versions",
+		 RelationGetRelationName(rel), nVisibleForAllTuples, nDeadTuples, nFrozenTuples, nTruncatedUndoChains, nUndoVersions, nDeletedVersions);
 
 	UndamVacuumIndexes(rel, deadBitmap, nTuples, bstrategy);
 	/* TODO: update statistic, relfrozenxid,... */
