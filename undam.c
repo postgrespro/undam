@@ -16,6 +16,7 @@
 #include "commands/vacuum.h"
 #include "executor/executor.h"
 #include "executor/tuptable.h"
+#include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
 #include "storage/bufmgr.h"
@@ -25,6 +26,7 @@
 #include "storage/predicate.h"
 #include "storage/procarray.h"
 #include "storage/smgr.h"
+#include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/inval.h"
 #include "utils/relcache.h"
@@ -43,6 +45,7 @@ void		_PG_init(void);
         elog(ERROR, "UNDAM: function \"%s\" is not implemented", __func__); \
     } while (0)
 
+static bool   UndamAutoChunkSize;
 static int    UndamChunkSize;
 static int    UndamNAllocChains;
 static int    UndamMaxRelations;
@@ -57,6 +60,9 @@ static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 
 static uint64 UndamDeleteTuple(Relation rel, UndamPosition pos, UndamPosition undo);
 
+/*
+ * Register modified buffer for logged relation using Generic WAL record.
+ */
 static Page
 UndamModifyBuffer(Relation rel, GenericXLogState* state, Buffer buf)
 {
@@ -73,6 +79,9 @@ UndamModifyBuffer(Relation rel, GenericXLogState* state, Buffer buf)
 	return pg;
 }
 
+/*
+ * Flush chnages to the log if needed
+ */
 static void
 UndamXLogFinish(Relation rel, GenericXLogState* state)
 {
@@ -87,6 +96,54 @@ UndamXLogFinish(Relation rel, GenericXLogState* state)
 			pfree(state);
 		}
 	}
+}
+
+/*
+ * Choose optimal chunk size for the relation.
+ * If relation has only fixed size attributes and their total size is in range [MIN_CHUNK_SIZE..MAX_CHUNK_SIZE] then use it chunk size
+ * for this relation so that record fits in one chunk. If total size is smaller than MIN_CHUNK_SIZE, then choose MIN_CHUNK_SIZE as chunk
+ * size for this relation. If total size is greater than MAX_CHUNK_SIZE or contains varying size attributes the use current value of
+ * undam.chunk_size GUC as chunk size.
+ * Please notice that this estimation may be not optimal in case of large fraction of NULL values in the record.
+ */
+static int32
+UndamOptimalChunkSize(Relation rel)
+{
+	int32		data_length = 0;
+	TupleDesc	tupdesc = rel->rd_att;
+	int32		tuple_length;
+	int saveEncoding = GetDatabaseEncoding();
+	SetDatabaseEncoding(PG_SQL_ASCII);
+
+	for (int i = 0; i < tupdesc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+
+		if (att->attisdropped)
+			continue;
+		data_length = att_align_nominal(data_length, att->attalign);
+		if (att->attlen > 0)
+		{
+			/* Fixed-length types are never toastable */
+			data_length += att->attlen;
+		}
+		else
+		{
+			int32		maxlen = type_maximum_size(att->atttypid,
+												   att->atttypmod);
+			if (maxlen < 0)
+			{
+				SetDatabaseEncoding(saveEncoding);
+				return UndamChunkSize;
+			}
+			else
+				data_length += maxlen;
+		}
+	}
+	SetDatabaseEncoding(saveEncoding);
+	tuple_length = MAXALIGN(offsetof(UndamTupleHeader, hdr.t_bits) +
+							BITMAPLEN(tupdesc->natts)) + MAXALIGN(data_length);
+	return tuple_length < MIN_CHUNK_SIZE ? MIN_CHUNK_SIZE : tuple_length < MAX_CHUNK_SIZE ? tuple_length : UndamChunkSize;
 }
 
 /*
@@ -1462,6 +1519,7 @@ static bool
 undam_tuple_tid_valid(TableScanDesc scan, ItemPointer tid)
 {
 	UndamScanDesc uscan = (UndamScanDesc)scan;
+	UndamRelationInfo* relinfo PG_USED_FOR_ASSERTS_ONLY = UndamGetRelationInfo(scan->rs_rd);
 	int item = ItemPointerGetOffsetNumber(&uscan->currItem);
 	BlockNumber   blocknum = ItemPointerGetBlockNumber(&uscan->currItem);
 	Buffer buf = UndamReadBuffer(scan->rs_rd, MAIN_FORKNUM, blocknum);
@@ -2328,7 +2386,14 @@ undam_relation_nontransactional_truncate(Relation rel)
 	ForkNumber	forks[EXT_FORKNUM+1] = {MAIN_FORKNUM, EXT_FORKNUM};
 	BlockNumber	blocks[EXT_FORKNUM+1] = {0,0};
 	UndamRelationInfo* relinfo = (UndamRelationInfo*)hash_search(UndamRelInfoHash, &RelationGetRelid(rel), HASH_ENTER, NULL);
+	int chunkSize = UndamChunkSize;
 
+	if (UndamAutoChunkSize)
+	{
+		chunkSize = UndamOptimalChunkSize(rel);
+		elog(LOG, "Use chunk size %d for relation %s",
+			 chunkSize, RelationGetRelationName(rel));
+	}
 	RelationOpenSmgr(rel);
 
 	/*
@@ -2338,7 +2403,7 @@ undam_relation_nontransactional_truncate(Relation rel)
 	rel->rd_smgr->smgr_fsm_nblocks = InvalidBlockNumber;
 	rel->rd_smgr->smgr_vm_nblocks = InvalidBlockNumber;
 
-	relinfo->chunkSize = UndamChunkSize;
+	relinfo->chunkSize = chunkSize;
 	relinfo->nChains = UndamNAllocChains;
 
 	if (RelationNeedsWAL(rel))
@@ -2359,7 +2424,7 @@ undam_relation_nontransactional_truncate(Relation rel)
 
 			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 			pg = (UndamPageHeader*)UndamModifyBuffer(rel, xlogState, buf);
-			pg->chunkSize = UndamChunkSize;
+			pg->chunkSize = chunkSize;
 			pg->nChains = UndamNAllocChains;
 			relinfo->chains[chain].forks[fork].head = pg->head = chain;
 			relinfo->chains[chain].forks[fork].tail = pg->tail = chain;
@@ -2879,6 +2944,16 @@ void _PG_init(void)
 	add_int_reloption(UndamReloptKind, "chunk", "Size of allocation chunk", 64, MIN_CHUNK_SIZE, MAX_CHUNK_SIZE, AccessExclusiveLock);
 	add_int_reloption(UndamReloptKind, "chains", "Number of allocation chains", 8, 1, MAX_ALLOC_CHAINS, AccessExclusiveLock);
 
+	DefineCustomBoolVariable("undam.auto_chunk_size",
+							 "Automatical choose chunk size for relation with fixed size attributes.",
+							 NULL,
+							 &UndamAutoChunkSize,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
 	DefineCustomIntVariable("undam.chunk_size",
 							"Size of allocation chunk.",
 							NULL,
