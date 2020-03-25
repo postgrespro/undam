@@ -37,6 +37,8 @@
 
 PG_MODULE_MAGIC;
 
+#define FORCE_TUPLE_LOCK 1
+
 PG_FUNCTION_INFO_V1(undam_tableam_handler);
 void		_PG_init(void);
 
@@ -1672,6 +1674,11 @@ undam_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
 		key_intact = false;
 	}
 
+#if FORCE_TUPLE_LOCK
+	heap_acquire_tuplock(relation, otid, *lockmode,
+						 LockWaitBlock, &have_tuple_lock);
+#endif
+
 	buffer = UndamReadBuffer(relation, MAIN_FORKNUM, ItemPointerGetBlockNumber(otid));
 	page = BufferGetPage(buffer);
 	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
@@ -1726,8 +1733,10 @@ l2:
 			 * lock.
 			 */
 			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+#if !FORCE_TUPLE_LOCK
 			heap_acquire_tuplock(relation, &(oldtup.t_self), *lockmode,
 								 LockWaitBlock, &have_tuple_lock);
+#endif
 			XactLockTableWait(xwait, relation, &oldtup.t_self,
 							  XLTW_Update);
 			checked_lockers = true;
@@ -1902,9 +1911,17 @@ l2:
 
 	END_CRIT_SECTION();
 
-	newtup->t_self = *otid;
-	UndamUpdateTuple(relation, newtup, buffer); /* will release buffer lock */
-
+	if (key_intact)
+	{
+		UndamUpdateTuple(relation, &oldtup, buffer);
+		UndamInsertTuple(relation, MAIN_FORKNUM, newtup);
+	}
+	else
+	{
+		newtup->t_self = *otid;
+		UndamUpdateTuple(relation, newtup, buffer); /* will release buffer lock */
+	}
+	slot->tts_tid = newtup->t_self;
 	/*
 	 * Release the lmgr tuple lock, if we had it.
 	 */
@@ -1927,7 +1944,13 @@ undam_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
                   LockWaitPolicy wait_policy, uint8 flags,
                   TM_FailureData *tmfd)
 {
-	HeapTuple tuple = UndamReadTuple(relation, SnapshotAny, tid);
+	HeapTuple tuple;
+	bool have_tuple_lock = false;
+
+	heap_acquire_tuplock(relation, tid, mode,
+						 wait_policy, &have_tuple_lock);
+
+	tuple = UndamReadTuple(relation, SnapshotAny, tid);
 	if (tuple != NULL) /* found some visible version */
 	{
 		ExecStoreHeapTuple(tuple, slot, true);
@@ -2215,6 +2238,11 @@ undam_tuple_delete(Relation relation, ItemPointer tid, CommandId cid,
 				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
 				 errmsg("cannot delete tuples during a parallel operation")));
 
+#if FORCE_TUPLE_LOCK
+	heap_acquire_tuplock(relation, tid, LockTupleExclusive,
+						 LockWaitBlock, &have_tuple_lock);
+#endif
+
 	block = ItemPointerGetBlockNumber(tid);
 	buffer = ReadBuffer(relation, block);
 	page = BufferGetPage(buffer);
@@ -2245,8 +2273,10 @@ l1:
 			 * lock.
 			 */
 			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+#if !FORCE_TUPLE_LOCK
 			heap_acquire_tuplock(relation, &(tp.t_self), LockTupleExclusive,
 								 LockWaitBlock, &have_tuple_lock);
+#endif
 			XactLockTableWait(xwait, relation, &(tp.t_self), XLTW_Delete);
 			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 
