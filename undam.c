@@ -1881,7 +1881,11 @@ l2:
 	 * will include checking the relation level, there is no benefit to a
 	 * separate check for the new tuple.
 	 */
+#if PG_VERSION_NUM >= 130000
 	CheckForSerializableConflictIn(relation, otid, BufferGetBlockNumber(buffer));
+#else
+	CheckForSerializableConflictIn(relation, &oldtup, BufferGetBlockNumber(buffer));
+#endif
 
 	START_CRIT_SECTION();
 
@@ -2343,7 +2347,11 @@ l1:
 	 * being visible to the scan (i.e., an exclusive buffer content lock is
 	 * continuously held from this point until the tuple delete is visible).
 	 */
+#if PG_VERSION_NUM >= 130000
 	CheckForSerializableConflictIn(relation, tid, BufferGetBlockNumber(buffer));
+#else
+	CheckForSerializableConflictIn(relation, &tp, BufferGetBlockNumber(buffer));
+#endif
 
 	xlogState = GenericXLogStart(relation);
 	page = UndamModifyBuffer(relation, xlogState, buffer);
@@ -2442,7 +2450,12 @@ undam_relation_nontransactional_truncate(Relation rel)
 	}
 
     /* Do the real work to truncate relation forks */
+#if PG_VERSION_NUM >= 130000
 	smgrtruncate(rel->rd_smgr, forks, 2, blocks);
+#else
+	for (int fork = MAIN_FORKNUM; fork <= EXT_FORKNUM; fork++)
+		smgrtruncate(rel->rd_smgr, forks[fork], blocks[fork]);
+#endif
 
 	for (int fork = MAIN_FORKNUM; fork <= EXT_FORKNUM; fork++)
 	{
@@ -2840,7 +2853,17 @@ undam_index_build_range_scan(Relation rel,
                        isnull);
 
         /* Call the AM's callback routine to process the tuple */
+#if PG_VERSION_NUM >= 130000
         callback(indexRelation, &slot->tts_tid, values, isnull, true, callback_state);
+#else
+		{
+			bool shouldFree = false;
+			HeapTuple tup = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
+			callback(indexRelation, tup, values, isnull, true, callback_state);
+			if (shouldFree)
+				heap_freetuple(tup);
+		}
+#endif
     }
 
     if (progress)
@@ -2971,9 +2994,13 @@ void _PG_init(void)
 		return;
 
 	UndamReloptKind = add_reloption_kind();
+#if PG_VERSION_NUM >= 130000
 	add_int_reloption(UndamReloptKind, "chunk", "Size of allocation chunk", 64, MIN_CHUNK_SIZE, MAX_CHUNK_SIZE, AccessExclusiveLock);
 	add_int_reloption(UndamReloptKind, "chains", "Number of allocation chains", 8, 1, MAX_ALLOC_CHAINS, AccessExclusiveLock);
-
+#else
+	add_int_reloption(UndamReloptKind, "chunk", "Size of allocation chunk", 64, MIN_CHUNK_SIZE, MAX_CHUNK_SIZE);
+	add_int_reloption(UndamReloptKind, "chains", "Number of allocation chains", 8, 1, MAX_ALLOC_CHAINS);
+#endif
 	DefineCustomBoolVariable("undam.auto_chunk_size",
 							 "Automatical choose chunk size for relation with fixed size attributes.",
 							 NULL,
