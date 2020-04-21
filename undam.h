@@ -104,6 +104,9 @@ typedef struct
 	Oid reloid;         /* relation OID */
 	uint32 chunkSize;   /* allocation chunk size */
 	uint32 nChains;     /* number of allocation chains */
+	uint32 nScannedTuples;
+	uint32 nScannedChunks;
+	uint32 nScannedVersions;
 	UndamAllocChain chains[MAX_ALLOC_CHAINS]; /* allocation chains themselves */
 } UndamRelationInfo;
 

@@ -16,6 +16,7 @@
 #include "commands/vacuum.h"
 #include "executor/executor.h"
 #include "executor/tuptable.h"
+#include "funcapi.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
@@ -40,6 +41,8 @@ PG_MODULE_MAGIC;
 #define FORCE_TUPLE_LOCK 1
 
 PG_FUNCTION_INFO_V1(undam_tableam_handler);
+PG_FUNCTION_INFO_V1(undam_rel_info);
+
 void		_PG_init(void);
 
 #define NOT_IMPLEMENTED							\
@@ -47,11 +50,12 @@ void		_PG_init(void);
         elog(ERROR, "UNDAM: function \"%s\" is not implemented", __func__); \
     } while (0)
 
-static bool   UndamAutoChunkSize;
-static int    UndamChunkSize;
-static int    UndamNAllocChains;
-static int    UndamMaxRelations;
-static HTAB*  UndamRelInfoHash;
+static bool        UndamAutoChunkSize;
+static int         UndamChunkSize;
+static int         UndamNAllocChains;
+static int         UndamMaxRelations;
+static HTAB*       UndamRelInfoHash;
+static LWLock*     UndamRelInfoLock;
 static relopt_kind UndamReloptKind;
 
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
@@ -171,7 +175,16 @@ static UndamRelationInfo*
 UndamGetRelationInfo(Relation rel)
 {
 	bool found;
-	UndamRelationInfo* relinfo = (UndamRelationInfo*)hash_search(UndamRelInfoHash, &RelationGetRelid(rel), HASH_ENTER, &found);
+	UndamRelationInfo* relinfo;
+
+	LWLockAcquire(UndamRelInfoLock, LW_SHARED);
+	relinfo = (UndamRelationInfo*)hash_search(UndamRelInfoHash, &RelationGetRelid(rel), HASH_FIND, NULL);
+	LWLockRelease(UndamRelInfoLock);
+	if (relinfo != NULL)
+		return relinfo;
+
+	LWLockAcquire(UndamRelInfoLock, LW_EXCLUSIVE);
+	relinfo = (UndamRelationInfo*)hash_search(UndamRelInfoHash, &RelationGetRelid(rel), HASH_ENTER, &found);
 	if (!found)
 	{
 		int nAllocChains = UndamNAllocChains;
@@ -199,7 +212,11 @@ UndamGetRelationInfo(Relation rel)
 				UnlockReleaseBuffer(buf);
 			}
 		}
+		relinfo->nScannedTuples = 0;
+		relinfo->nScannedChunks = 0;
+		relinfo->nScannedVersions = 0;
 	}
+	LWLockRelease(UndamRelInfoLock);
 	return relinfo;
 }
 
@@ -233,10 +250,11 @@ UndamShmemStartup(void)
 	memset(&info, 0, sizeof(info));
 	info.keysize = sizeof(Oid);
 	info.entrysize = sizeof(UndamRelationInfo);
-	UndamRelInfoHash =  ShmemInitHash("undam hash",
-									  UndamMaxRelations, UndamMaxRelations,
-									  &info,
-									  HASH_ELEM | HASH_BLOBS);
+	UndamRelInfoHash = ShmemInitHash("undam hash",
+									 UndamMaxRelations, UndamMaxRelations,
+									 &info,
+									 HASH_ELEM | HASH_BLOBS);
+	UndamRelInfoLock = &(GetNamedLWLockTranche("undam"))->lock;
 }
 
 /*
@@ -461,7 +479,7 @@ UndamReadTuple(Relation rel, Snapshot snapshot, ItemPointer ip)
 
 	tuphdr.t_tableOid = RelationGetRelid(rel);
 	tuphdr.t_self = *ip;
-
+	relinfo->nScannedTuples += 1;
 	do
 	{
 		Buffer buf = UndamReadBuffer(rel, forknum, blocknum);
@@ -475,6 +493,8 @@ UndamReadTuple(Relation rel, Snapshot snapshot, ItemPointer ip)
 		tuphdr.t_data = &tup->hdr;
 		tuphdr.t_len = len;
 
+		relinfo->nScannedVersions += 1;
+
 		if (HeapTupleSatisfiesVisibility(&tuphdr, snapshot, buf))
 		{
 			HeapTuple tuple = (HeapTuple)palloc(sizeof(HeapTupleData) + len);
@@ -482,6 +502,8 @@ UndamReadTuple(Relation rel, Snapshot snapshot, ItemPointer ip)
 
 			*tuple = tuphdr;
 			tuple->t_data = (HeapTupleHeader)(tuple + 1); /* store tuple's body just after the header */
+			relinfo->nScannedChunks += 1;
+
 			if (len <= available)
 			{
 				memcpy(tuple->t_data, &tup->hdr, len); /* tuple fits in one chunk */
@@ -509,6 +531,7 @@ UndamReadTuple(Relation rel, Snapshot snapshot, ItemPointer ip)
 					next = chunk->next;
 					dst += available;
 					len -= available;
+					relinfo->nScannedChunks += 1;
 				} while (len > 0);
 			}
 			UnlockReleaseBuffer(buf);
@@ -2423,9 +2446,12 @@ undam_relation_nontransactional_truncate(Relation rel)
 {
 	ForkNumber	forks[EXT_FORKNUM+1] = {MAIN_FORKNUM, EXT_FORKNUM};
 	BlockNumber	blocks[EXT_FORKNUM+1] = {0,0};
-	UndamRelationInfo* relinfo = (UndamRelationInfo*)hash_search(UndamRelInfoHash, &RelationGetRelid(rel), HASH_ENTER, NULL);
+	UndamRelationInfo* relinfo;
 	int chunkSize = UndamChunkSize;
 
+	LWLockAcquire(UndamRelInfoLock, LW_EXCLUSIVE);
+
+	relinfo = (UndamRelationInfo*)hash_search(UndamRelInfoHash, &RelationGetRelid(rel), HASH_ENTER, NULL);
 	if (UndamAutoChunkSize)
 	{
 		chunkSize = UndamOptimalChunkSize(rel);
@@ -2478,6 +2504,7 @@ undam_relation_nontransactional_truncate(Relation rel)
 			UnlockReleaseBuffer(buf);
 		}
 	}
+	LWLockRelease(UndamRelInfoLock);
 }
 
 static void
@@ -2986,7 +3013,7 @@ void _PG_init(void)
 	 * In order to create our shared memory area, we have to be loaded via
 	 * shared_preload_libraries.  If not, fall out without hooking into any of
 	 * the main system.  (We don't throw error here because it seems useful to
-	 * allow the cs_* functions to be created even when the
+	 * allow the undam functions to be created even when the
 	 * module isn't active.  The functions must protect themselves against
 	 * being called then, however.)
 	 */
@@ -3050,6 +3077,40 @@ void _PG_init(void)
 							NULL);
 
 	RequestAddinShmemSpace(hash_estimate_size(UndamMaxRelations, sizeof(UndamRelationInfo)));
+	RequestNamedLWLockTranche("undam", 1);
 	prev_shmem_startup_hook = shmem_startup_hook;
 	shmem_startup_hook = UndamShmemStartup;
+}
+
+#define UNDAM_REL_INFO_COLS 3
+
+Datum
+undam_rel_info(PG_FUNCTION_ARGS)
+{
+	TupleDesc	tupdesc;
+	Datum		values[UNDAM_REL_INFO_COLS];
+	bool		nulls[UNDAM_REL_INFO_COLS];
+	Oid         relid = PG_GETARG_OID(0);
+	UndamRelationInfo* relinfo;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+
+	LWLockAcquire(UndamRelInfoLock, LW_SHARED);
+	relinfo = (UndamRelationInfo*)hash_search(UndamRelInfoHash, &relid, HASH_FIND, NULL);	
+	LWLockRelease(UndamRelInfoLock);
+
+	if (relinfo)
+	{
+		MemSet(nulls, false, sizeof(nulls));
+		values[0] = relinfo->nScannedTuples;
+		values[1] = relinfo->nScannedVersions;
+		values[2] = relinfo->nScannedChunks;
+	}
+	else
+	{
+		MemSet(nulls, true, sizeof(nulls));
+	}
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
