@@ -352,8 +352,6 @@ UndamWriteData(Relation rel, int forknum, char* data, uint32 size, UndamPosition
 		{
 			BlockNumber nextFree = pg->next;
 
-			pg->pd_flags |= PD_PAGE_FULL;
-
 			if (chainNo != blocknum) /* target chunk is not chain header */
 			{
 				if (chain == NULL)
@@ -373,6 +371,7 @@ UndamWriteData(Relation rel, int forknum, char* data, uint32 size, UndamPosition
 
 			if (chain->head == blocknum) /* Alloc chain was not already updated by some other backend */
 			{
+				pg->pd_flags |= PD_PAGE_FULL;
 				relinfo->chains[chainNo].forks[forknum].head = chain->head = nextFree;
 			}
 		}
@@ -2723,7 +2722,7 @@ undam_scan_analyze_next_tuple(TableScanDesc scan, TransactionId OldestXmin,
 					memcpy(dst, &tup->hdr, available);
 					dst += available;
 					len -= available;
-					available =  CHUNK_SIZE - offsetof(UndamTupleChunk, data); /* head chunk contains less data */
+					available = CHUNK_SIZE - offsetof(UndamTupleChunk, data); /* head chunk contains less data */
 
 					do {
 						Assert(next != INVALID_POSITION);
