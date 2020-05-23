@@ -43,6 +43,12 @@ PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(undam_tableam_handler);
 PG_FUNCTION_INFO_V1(undam_rel_info);
 
+typedef struct _MdfdVec
+{
+	File		mdfd_vfd;		/* fd number in fd.c's pool */
+	BlockNumber mdfd_segno;		/* segment number, from 0 */
+} MdfdVec;
+
 void		_PG_init(void);
 
 #define NOT_IMPLEMENTED							\
@@ -270,35 +276,56 @@ UndamWriteData(Relation rel, int forknum, char* data, uint32 size, UndamPosition
 	int chunkDataSize = CHUNK_SIZE - offsetof(UndamTupleChunk, data); /* We use UndamTupleChunk for estimating of size of data stored in tuple, because head chunk is always written separately */
 	int nChunks = (size + chunkDataSize - 1) / chunkDataSize;
 	int available = size - (nChunks-1) * chunkDataSize;
+	int chainNo = random() % N_ALLOC_CHAINS; /* choose random chain to minimize probability of allocation chain buffer lock conflicts */
+	static const char zeros[BLCKSZ];
 
 	Assert(undoPos != 0 && tailChunk != 0);
 
  	do
 	{
-		int chainNo = random() % N_ALLOC_CHAINS; /* choose random chain to minimize probability of allocation chain buffer lock conflicts */
 		BlockNumber blocknum = relinfo->chains[chainNo].forks[forknum].head;
-		GenericXLogState* xlogState = GenericXLogStart(rel);
 		UndamPageHeader* pg;
 		UndamPageHeader* chain = NULL;
 		int item = CHUNKS_PER_BLOCK; /* We need to link chaunks in L1 list so we have to write them in reverse order */
 		Buffer chainBuf = InvalidBuffer;
 		Buffer buf;
+		int    segno;
+		GenericXLogState* xlogState = GenericXLogStart(rel);
 
 		if (blocknum == InvalidBlockNumber) /* Allocation chain is empty */
 		{
 			chainBuf = UndamReadBuffer(rel, forknum, chainNo);
 			LockBuffer(chainBuf, BUFFER_LOCK_EXCLUSIVE);
-			chain = (UndamPageHeader*)UndamModifyBuffer(rel, xlogState, chainBuf);
+			chain = (UndamPageHeader*)BufferGetPage(chainBuf);
 			if (chain->head == InvalidBlockNumber) /* extend chain */
 			{
 				Assert(relinfo->chains[chainNo].forks[forknum].tail == chain->tail);
+				chain = (UndamPageHeader*)UndamModifyBuffer(rel, xlogState, chainBuf);
 				blocknum = chain->tail += N_ALLOC_CHAINS;
+				/*
+				 * Check if segment is already opened. We have to do this check to prevent
+				 * error in _mdfd_getseg when crossing segment boundary
+				 */
+				segno = blocknum/RELSEG_SIZE;
+				if (segno > 0 && rel->rd_smgr->md_num_open_segs[forknum] == segno)
+				{
+					FileTruncate(rel->rd_smgr->md_seg_fds[forknum][segno-1].mdfd_vfd, RELSEG_SIZE*BLCKSZ, WAIT_EVENT_DATA_FILE_TRUNCATE);
+					smgrextend(rel->rd_smgr, forknum, blocknum, (char*)zeros, true);
+				}
+				/* To avoid deadlock we enforce that block with smaller address is locked first */
+				Assert(blocknum > chainNo);
 				chain->head = blocknum;
 				relinfo->chains[chainNo].forks[forknum].tail = blocknum;
 				relinfo->chains[chainNo].forks[forknum].head = blocknum;
 			}
 			else
+			{
 				blocknum = chain->head;
+				/* Release chain buffer to avoid deadlock */
+				UnlockReleaseBuffer(chainBuf);
+				chainBuf = InvalidBuffer;
+				chain = NULL;
+			}
 		}
 		buf = UndamReadBuffer(rel, forknum, blocknum);
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
@@ -359,8 +386,39 @@ UndamWriteData(Relation rel, int forknum, char* data, uint32 size, UndamPosition
 					Assert(chainBuf == InvalidBuffer);
 					/* Locate block with chain header */
 					chainBuf = UndamReadBuffer(rel, forknum, chainNo);
-					LockBuffer(chainBuf, BUFFER_LOCK_EXCLUSIVE);
-					chain = (UndamPageHeader*)UndamModifyBuffer(rel, xlogState, chainBuf);
+					/* To avoid deadlock we enforce that block with smaller address is locked first */
+					if (chainNo < blocknum)
+					{
+						/* Save updated page, unlock it and then lock chain header */
+						UndamXLogFinish(rel, xlogState);
+						xlogState = NULL;
+						LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+
+						LockBuffer(chainBuf, BUFFER_LOCK_EXCLUSIVE);
+						LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+						pg = (UndamPageHeader*)BufferGetPage(buf);
+						if (!(pg->pd_flags & PD_PAGE_FULL))
+						{
+							item = CHUNKS_PER_BLOCK;
+							/* Recheck that page is still full */
+							do
+							{
+								item -= 1;
+							}
+							while (pg->allocMask[item >> 6] & ((uint64)1 << (item & 63)));  /* first chunk is not allocated, so use it as barrier */
+							if (item == 0)
+							{
+								xlogState = GenericXLogStart(rel);
+								chain = (UndamPageHeader*)UndamModifyBuffer(rel, xlogState, chainBuf);
+								nextFree = pg->next;
+							}
+						}
+					}
+					else
+					{
+						LockBuffer(chainBuf, BUFFER_LOCK_EXCLUSIVE);
+						chain = (UndamPageHeader*)UndamModifyBuffer(rel, xlogState, chainBuf);
+					}
 				}
 			}
 			else
@@ -369,13 +427,16 @@ UndamWriteData(Relation rel, int forknum, char* data, uint32 size, UndamPosition
 				chain = pg;
 			}
 
-			if (chain->head == blocknum) /* Alloc chain was not already updated by some other backend */
+			if (chain && chain->head == blocknum) /* Alloc chain was not already updated by some other backend */
 			{
+				Assert(!(pg->pd_flags & PD_PAGE_FULL));
+				Assert(nextFree != blocknum);
 				pg->pd_flags |= PD_PAGE_FULL;
 				relinfo->chains[chainNo].forks[forknum].head = chain->head = nextFree;
 			}
 		}
 		UndamXLogFinish(rel, xlogState);
+		xlogState = NULL;
 		UnlockReleaseBuffer(buf);
 		if (chainBuf)
 			UnlockReleaseBuffer(chainBuf);
@@ -564,12 +625,30 @@ UndamDeleteTuple(Relation rel, UndamPosition pos, UndamPosition undo)
 		Buffer buf = UndamReadBuffer(rel, EXT_FORKNUM, blocknum);
 		GenericXLogState* xlogState = GenericXLogStart(rel);
 		UndamPageHeader* pg;
-		Buffer chainBuf = InvalidBuffer;
 		UndamPosition next;
-
+		int chainNo = 0;
+		Buffer chainBuf = InvalidBuffer;
 		Assert(item > 0 && item < CHUNKS_PER_BLOCK);
 
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		pg = (UndamPageHeader*)BufferGetPage(buf);
+		if (pg->pd_flags & PD_PAGE_FULL) /* page was full: include it in allocation chain  */
+		{
+			chainNo = blocknum % N_ALLOC_CHAINS;
+			if (chainNo != blocknum)
+			{
+				chainBuf = UndamReadBuffer(rel, EXT_FORKNUM, chainNo);
+				/* To avoid deadlock we enforce that block with smaller address is locked first */
+				if (chainNo < blocknum)
+				{
+					LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+					LockBuffer(chainBuf, BUFFER_LOCK_EXCLUSIVE);
+					LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+				}
+				else
+					LockBuffer(chainBuf, BUFFER_LOCK_EXCLUSIVE);
+			}
+		}
 		pg = (UndamPageHeader*)UndamModifyBuffer(rel, xlogState, buf);
 		Assert(pg->allocMask[item >> 6] & ((uint64)1 << (item & 63)));
 		pg->allocMask[item >> 6] &= ~((uint64)1 << (item & 63));
@@ -591,20 +670,18 @@ UndamDeleteTuple(Relation rel, UndamPosition pos, UndamPosition undo)
 		memset((char*)pg + item*CHUNK_SIZE, 0xDE, CHUNK_SIZE);
 		if (pg->pd_flags & PD_PAGE_FULL) /* page was full: include it in allocation chain  */
 		{
-			int chainNo = blocknum % N_ALLOC_CHAINS;
 			UndamPageHeader* chain;
 
 			pg->pd_flags &= ~PD_PAGE_FULL;
 
-			if (chainNo != blocknum) /* check if allocation chain header is at the same page */
+			if (chainBuf) /* check if allocation chain header is at the same page */
 			{
-				chainBuf = UndamReadBuffer(rel, EXT_FORKNUM, chainNo);
-				LockBuffer(chainBuf, BUFFER_LOCK_EXCLUSIVE);
 				chain = (UndamPageHeader*)UndamModifyBuffer(rel, xlogState, chainBuf);
 				Assert(chain->head == relinfo->chains[chainNo].forks[EXT_FORKNUM].head);
 			}
 			else
 			{
+				Assert(chainNo == blocknum);
 				chain = pg;
 			}
 			/* Update chain header */
@@ -2102,6 +2179,7 @@ undam_relation_vacuum(Relation rel,
 		UndamPageHeader* pg = (UndamPageHeader*)BufferGetPage(buf);
 		GenericXLogState* xlogState = NULL;
 		int nDeleted = 0;
+		int chainNo = 0;
 		Buffer chainBuf = InvalidBuffer;
 
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
@@ -2122,6 +2200,23 @@ undam_relation_vacuum(Relation rel,
 							/* Retry scan of page under execlusive lock */
 							LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 							LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+							if (pg->pd_flags & PD_PAGE_FULL) /* page was full: include it in allocation chain  */
+							{
+								chainNo = block % N_ALLOC_CHAINS;
+								if (chainNo != block)
+								{
+									chainBuf = UndamReadBuffer(rel, MAIN_FORKNUM, chainNo);
+									/* To avoid deadlock we enforce that block with smaller address is locked first */
+									if (chainNo < block)
+									{
+										LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+										LockBuffer(chainBuf, BUFFER_LOCK_EXCLUSIVE);
+										LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+									}
+									else
+										LockBuffer(chainBuf, BUFFER_LOCK_EXCLUSIVE);
+								}
+							}
 							xlogState = GenericXLogStart(rel);
 							pg = (UndamPageHeader*)UndamModifyBuffer(rel, xlogState, buf);
 							tup = (UndamTupleHeader*)((char*)pg + chunk*CHUNK_SIZE);
@@ -2196,21 +2291,19 @@ undam_relation_vacuum(Relation rel,
 
 		if (nDeleted != 0 && (pg->pd_flags & PD_PAGE_FULL))  /* page was full: include it in allocation chain  */
 		{
-			int chainNo = block % N_ALLOC_CHAINS;
 			UndamPageHeader* chain;
 
 			Assert(xlogState != NULL);
 			pg->pd_flags &= ~PD_PAGE_FULL;
 
-			if (chainNo != block) /* check if allocation chain header is at the same page */
+			if (chainBuf) /* check if allocation chain header is at the same page */
 			{
-				chainBuf = UndamReadBuffer(rel, MAIN_FORKNUM, chainNo);
-				LockBuffer(chainBuf, BUFFER_LOCK_EXCLUSIVE);
 				chain = (UndamPageHeader*)UndamModifyBuffer(rel, xlogState, chainBuf);
 				Assert(chain->head == relinfo->chains[chainNo].forks[MAIN_FORKNUM].head);
 			}
 			else
 			{
+				Assert(chainNo == block);
 				chain = pg;
 			}
 			/* Update chain header */
