@@ -1419,7 +1419,7 @@ undam_beginscan(Relation relation, Snapshot snapshot,
     scan->base.rs_flags = flags;
 	scan->base.rs_parallel = parallel_scan;
 	scan->lastBlock = UndamGetLastBlock(relation, MAIN_FORKNUM);
-	ItemPointerSet(&scan->currItem, 0, 1);
+	ItemPointerSet(&scan->currItem, 0, 0);
     return (TableScanDesc) scan;
 }
 
@@ -1430,21 +1430,21 @@ undam_getnextslot(TableScanDesc scan, ScanDirection direction, TupleTableSlot *s
     Relation      rel = scan->rs_rd;
 	UndamRelationInfo* relinfo = UndamGetRelationInfo(rel);
 	HeapTuple     tuple;
-	int           item = ItemPointerGetOffsetNumber(&uscan->currItem); /* next item to try */
-	BlockNumber   blocknum = ItemPointerGetBlockNumber(&uscan->currItem);
+	int           item = ItemPointerGetOffsetNumberNoCheck(&uscan->currItem); /* next item to try */
+	BlockNumber   blocknum = ItemPointerGetBlockNumberNoCheck(&uscan->currItem);
 	int           nChunks = CHUNKS_PER_BLOCK;
 	ParallelBlockTableScanDesc pbscan =	(ParallelBlockTableScanDesc) scan->rs_parallel;
     /* TODO: handle direction */
     if (direction == BackwardScanDirection)
         elog(ERROR, "UNDAM: backward scan is not implemented");
 
-	if (pbscan != NULL)
+	if (pbscan != NULL && item == 0)
 	{
 
 		table_block_parallelscan_startblock_init(scan->rs_rd, pbscan);
 		blocknum = table_block_parallelscan_nextpage(scan->rs_rd, pbscan);
 	}
-
+	item += 1;
 	while (blocknum < uscan->lastBlock)
 	{
 		Buffer buf = UndamReadBuffer(rel, MAIN_FORKNUM, blocknum);
@@ -1462,7 +1462,7 @@ undam_getnextslot(TableScanDesc scan, ScanDirection direction, TupleTableSlot *s
 				{
 					ExecStoreHeapTuple(tuple, slot, true);
 					UnlockReleaseBuffer(buf);
-					ItemPointerSetOffsetNumber(&uscan->currItem, item+1);
+					ItemPointerSetOffsetNumber(&uscan->currItem, item);
 					return true;
 				}
 			}
