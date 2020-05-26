@@ -1688,18 +1688,161 @@ undam_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 }
 
 static void
-undam_tuple_insert_speculative(Relation relation, TupleTableSlot *slot,
+undam_tuple_insert_speculative(Relation rel, TupleTableSlot *slot,
 							   CommandId cid, int options,
 							   BulkInsertState bistate, uint32 specToken)
 {
-    NOT_IMPLEMENTED;
+	HeapTuple tup = ExecCopySlotHeapTuple(slot);
+	TransactionId xid = GetCurrentTransactionId();
+
+	tup->t_data->t_infomask &= ~(HEAP_XACT_MASK);
+	tup->t_data->t_infomask2 &= ~(HEAP2_XACT_MASK);
+	tup->t_data->t_infomask |= HEAP_XMAX_INVALID;
+	HeapTupleHeaderSetXmin(tup->t_data, xid);
+	if (options & HEAP_INSERT_FROZEN)
+		HeapTupleHeaderSetXminFrozen(tup->t_data);
+	HeapTupleHeaderSetSpeculativeToken(tup->t_data, specToken);
+
+	HeapTupleHeaderSetCmin(tup->t_data, cid);
+	HeapTupleHeaderSetXmax(tup->t_data, 0); /* for cleanliness */
+	slot->tts_tableOid = tup->t_tableOid = RelationGetRelid(rel);
+
+	UndamInsertTuple(rel, MAIN_FORKNUM, tup);
+	slot->tts_tid = tup->t_self;
+
+	pfree(tup);
 }
 
 static void
-undam_tuple_complete_speculative(Relation relation, TupleTableSlot *slot,
+undam_abort_speculative(Relation rel, ItemPointer tid)
+{
+	TransactionId xid = GetCurrentTransactionId();
+	BlockNumber block;
+	Buffer		buffer;
+	TransactionId prune_xid;
+	GenericXLogState* xlogState;
+	Page* pg;
+	HeapTupleHeader tup;
+	UndamRelationInfo* relinfo = UndamGetRelationInfo(rel);
+
+	Assert(ItemPointerIsValid(tid));
+
+	block = ItemPointerGetBlockNumber(tid);
+	buffer = ReadBuffer(rel, block);
+
+	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+
+	xlogState = GenericXLogStart(rel);
+	pg = (Page*)UndamModifyBuffer(rel, xlogState, buffer);
+
+	tup = &((UndamTupleHeader*)((char*)pg + ItemPointerGetOffsetNumber(tid)*CHUNK_SIZE))->hdr;
+	/*
+	 * Sanity check that the tuple really is a speculatively inserted tuple,
+	 * inserted by us.
+	 */
+	if (tup->t_choice.t_heap.t_xmin != xid)
+		elog(ERROR, "attempted to kill a tuple inserted by another transaction");
+	if (!HeapTupleHeaderIsSpeculative(tup))
+		elog(ERROR, "attempted to kill a non-speculative tuple");
+	Assert(!HeapTupleHeaderIsHeapOnly(tup));
+
+	/*
+	 * No need to check for serializable conflicts here.  There is never a
+	 * need for a combocid, either.  No need to extract replica identity, or
+	 * do anything special with infomask bits.
+	 */
+
+	START_CRIT_SECTION();
+
+	/*
+	 * The tuple will become DEAD immediately.  Flag that this page is a
+	 * candidate for pruning by setting xmin to TransactionXmin. While not
+	 * immediately prunable, it is the oldest xid we can cheaply determine
+	 * that's safe against wraparound / being older than the table's
+	 * relfrozenxid.  To defend against the unlikely case of a new relation
+	 * having a newer relfrozenxid than our TransactionXmin, use relfrozenxid
+	 * if so (vacuum can't subsequently move relfrozenxid to beyond
+	 * TransactionXmin, so there's no race here).
+	 */
+	Assert(TransactionIdIsValid(TransactionXmin));
+	if (TransactionIdPrecedes(TransactionXmin, rel->rd_rel->relfrozenxid))
+		prune_xid = rel->rd_rel->relfrozenxid;
+	else
+		prune_xid = TransactionXmin;
+	PageSetPrunable(pg, prune_xid);
+
+	/* store transaction information of xact deleting the tuple */
+	tup->t_infomask &= ~(HEAP_XMAX_BITS | HEAP_MOVED);
+	tup->t_infomask2 &= ~HEAP_KEYS_UPDATED;
+
+	/*
+	 * Set the tuple header xmin to InvalidTransactionId.  This makes the
+	 * tuple immediately invisible everyone.  (In particular, to any
+	 * transactions waiting on the speculative token, woken up later.)
+	 */
+	HeapTupleHeaderSetXmin(tup, InvalidTransactionId);
+
+	/* Clear the speculative insertion token too */
+	tup->t_ctid = *tid;
+
+	END_CRIT_SECTION();
+	UndamXLogFinish(rel, xlogState);
+	UnlockReleaseBuffer(buffer);
+
+	pgstat_count_heap_delete(rel);
+}
+
+static void
+undam_finish_speculative(Relation rel, ItemPointer tid)
+{
+	BlockNumber block;
+	Buffer		buffer;
+	GenericXLogState* xlogState;
+	Page* pg;
+	HeapTupleHeader tup;
+	UndamRelationInfo* relinfo = UndamGetRelationInfo(rel);
+
+	Assert(ItemPointerIsValid(tid));
+
+	block = ItemPointerGetBlockNumber(tid);
+	buffer = ReadBuffer(rel, block);
+
+	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+
+	xlogState = GenericXLogStart(rel);
+	pg = (Page*)UndamModifyBuffer(rel, xlogState, buffer);
+
+	/*
+	 * Replace the speculative insertion token with a real t_ctid, pointing to
+	 * itself like it does on regular tuples.
+	 */
+	tup = &((UndamTupleHeader*)((char*)pg + ItemPointerGetOffsetNumber(tid)*CHUNK_SIZE))->hdr;
+
+	START_CRIT_SECTION();
+
+	tup->t_ctid = *tid;
+
+	END_CRIT_SECTION();
+
+	UndamXLogFinish(rel, xlogState);
+	UnlockReleaseBuffer(buffer);
+}
+
+static void
+undam_tuple_complete_speculative(Relation rel, TupleTableSlot *slot,
 								 uint32 specToken, bool succeeded)
 {
-    NOT_IMPLEMENTED;
+	bool		shouldFree = true;
+	HeapTuple	tuple = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
+
+	/* adjust the tuple's state accordingly */
+	if (succeeded)
+		undam_finish_speculative(rel, &slot->tts_tid);
+	else
+		undam_abort_speculative(rel, &slot->tts_tid);
+
+	if (shouldFree)
+		pfree(tuple);
 }
 
 static TM_Result
