@@ -2291,7 +2291,7 @@ undam_relation_vacuum(Relation rel,
 	BlockNumber lastBlock = UndamGetLastBlock(rel, MAIN_FORKNUM);
 	int nChunks = CHUNKS_PER_BLOCK;
 	HeapTupleData tuple;
-	uint64 nTuples  = (uint64)lastBlock*nChunks;
+	uint64  nTuples  = (uint64)lastBlock*nChunks;
 	uint64* deadBitmap = (uint64*)calloc((nTuples+63)/64, 8); /* bitmap can be larger than 1Gb, so use calloc */
 	uint64  nDeadTuples = 0;
 	uint64  nVisibleForAllTuples = 0;
@@ -2321,9 +2321,6 @@ undam_relation_vacuum(Relation rel,
 		Buffer buf = UndamReadBuffer(rel, MAIN_FORKNUM, block);
 		UndamPageHeader* pg = (UndamPageHeader*)BufferGetPage(buf);
 		GenericXLogState* xlogState = NULL;
-		int nDeleted = 0;
-		int chainNo = 0;
-		Buffer chainBuf = InvalidBuffer;
 
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 
@@ -2332,7 +2329,17 @@ undam_relation_vacuum(Relation rel,
 			if (pg->allocMask[chunk >> 6] & ((uint64)1 << (chunk & 63)))
 			{
 				UndamTupleHeader* tup = (UndamTupleHeader*)((char*)pg + chunk*CHUNK_SIZE);
-				if (!HeapTupleHeaderXminFrozen(&tup->hdr))
+				tuple.t_data = &tup->hdr;
+				tuple.t_len =  tup->size;
+				if (HeapTupleSatisfiesVacuum(&tuple, oldestXmin, buf) == HEAPTUPLE_DEAD)
+				{
+					/* We can not delete dead tuples immediately because them are referenced by index */
+					UndamPosition pos = GET_POSITION(block, chunk);
+					Assert(tup->undoChain == INVALID_POSITION);
+					deadBitmap[pos >> 6] |= (uint64)1 << (pos & 63);
+					nDeadTuples += 1;
+				}
+				else if (!HeapTupleHeaderXminFrozen(&tup->hdr))
 				{
 					TransactionId xmin = HeapTupleHeaderGetRawXmin(&tup->hdr);
 					if (TransactionIdPrecedes(xmin, oldestXmin)) /* Tuple is visible for everybody */
@@ -2340,26 +2347,9 @@ undam_relation_vacuum(Relation rel,
 						nVisibleForAllTuples += 1;
 						if (xlogState == NULL)
 						{
-							/* Retry scan of page under execlusive lock */
+							/* Upgrade buffer lock to exclusive */
 							LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 							LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-							if (pg->pd_flags & PD_PAGE_FULL) /* page was full: include it in allocation chain  */
-							{
-								chainNo = block % N_ALLOC_CHAINS;
-								if (chainNo != block)
-								{
-									chainBuf = UndamReadBuffer(rel, MAIN_FORKNUM, chainNo);
-									/* To avoid deadlock we enforce that block with smaller address is locked first */
-									if (chainNo < block)
-									{
-										LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-										LockBuffer(chainBuf, BUFFER_LOCK_EXCLUSIVE);
-										LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-									}
-									else
-										LockBuffer(chainBuf, BUFFER_LOCK_EXCLUSIVE);
-								}
-							}
 							xlogState = GenericXLogStart(rel);
 							pg = (UndamPageHeader*)UndamModifyBuffer(rel, xlogState, buf);
 							tup = (UndamTupleHeader*)((char*)pg + chunk*CHUNK_SIZE);
@@ -2367,16 +2357,7 @@ undam_relation_vacuum(Relation rel,
 						}
 						tuple.t_data = &tup->hdr;
 						tuple.t_len =  tup->size;
-						if (HeapTupleSatisfiesVacuum(&tuple, oldestXmin, buf) == HEAPTUPLE_DEAD)
-						{
-							UndamPosition pos = GET_POSITION(block, chunk);
-							pg->allocMask[chunk >> 6] &= ~((uint64)1 << (chunk & 63));
-							deadBitmap[pos >> 6] |= (uint64)1 << (pos & 63);
-							nDeleted += 1;
-							if (tup->nextChunk != INVALID_POSITION)
-								nDeletedVersions += UndamDeleteTuple(rel, tup->nextChunk, INVALID_POSITION); /* delete tuple tail */
-						}
-						else if (TransactionIdPrecedes(xmin, freezeLimit))
+						if (TransactionIdPrecedes(xmin, freezeLimit))
 						{
 							/* TODO: not sure that it is enough to freeze tuple: or should we use heap_freeze_tuple ? */
 							tup->hdr.t_infomask |= HEAP_XMIN_FROZEN;
@@ -2430,39 +2411,95 @@ undam_relation_vacuum(Relation rel,
 				}
 			}
 		}
-		nDeadTuples += nDeleted;
-
-		if (nDeleted != 0 && (pg->pd_flags & PD_PAGE_FULL))  /* page was full: include it in allocation chain  */
-		{
-			UndamPageHeader* chain;
-
-			Assert(xlogState != NULL);
-			pg->pd_flags &= ~PD_PAGE_FULL;
-
-			if (chainBuf) /* check if allocation chain header is at the same page */
-			{
-				chain = (UndamPageHeader*)UndamModifyBuffer(rel, xlogState, chainBuf);
-				Assert(chain->head == relinfo->chains[chainNo].forks[MAIN_FORKNUM].head);
-			}
-			else
-			{
-				Assert(chainNo == block);
-				chain = pg;
-			}
-			/* Update chain header */
-			pg->next = chain->head;
-			chain->head = block;
-			relinfo->chains[chainNo].forks[MAIN_FORKNUM].head = block;
-		}
 		UndamXLogFinish(rel, xlogState);
 		UnlockReleaseBuffer(buf);
-		if (chainBuf)
-			UnlockReleaseBuffer(chainBuf);
+	}
+	if (nDeadTuples != 0)
+	{
+		/* Some tuples can be deleted, s we need to update indexes */
+		UndamVacuumIndexes(rel, deadBitmap, nTuples, bstrategy);
+
+		/* Second pass: do actual deletion of tuples */
+		for (BlockNumber block = 0; block < lastBlock; block++)
+		{
+			UndamTupleHeader* tup = NULL;
+			Buffer buf = InvalidBuffer;
+			GenericXLogState* xlogState = NULL;
+			UndamPageHeader* pg = NULL;
+			Buffer chainBuf = InvalidBuffer;
+			int chainNo = 0;
+
+			for (int chunk = 1; chunk < nChunks; chunk++)
+			{
+				UndamPosition pos = GET_POSITION(block, chunk);
+				if (deadBitmap[pos >> 6] & ((uint64)1 << (pos & 63)))
+				{
+					if (!xlogState)
+					{
+						chainNo = block % N_ALLOC_CHAINS;
+						buf = UndamReadBuffer(rel, MAIN_FORKNUM, block);
+						LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+						pg = (UndamPageHeader*)BufferGetPage(buf);
+
+						if (pg->pd_flags & PD_PAGE_FULL) /* page was full: include it in allocation chain  */
+						{
+							if (chainNo != block)
+							{
+								chainBuf = UndamReadBuffer(rel, MAIN_FORKNUM, chainNo);
+								/* To avoid deadlock we enforce that block with smaller address is locked first */
+								if (chainNo < block)
+								{
+									LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+									LockBuffer(chainBuf, BUFFER_LOCK_EXCLUSIVE);
+									LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+								}
+								else
+									LockBuffer(chainBuf, BUFFER_LOCK_EXCLUSIVE);
+							}
+						}
+						xlogState = GenericXLogStart(rel);
+						pg = (UndamPageHeader*)UndamModifyBuffer(rel, xlogState, buf);
+						Assert(pg->allocMask[chunk >> 6] & ((uint64)1 << (chunk & 63)));
+						pg->allocMask[chunk >> 6] &= ~((uint64)1 << (chunk & 63));
+						tup = (UndamTupleHeader*)((char*)pg + chunk*CHUNK_SIZE);
+						if (tup->nextChunk != INVALID_POSITION)
+							nDeletedVersions += UndamDeleteTuple(rel, tup->nextChunk, INVALID_POSITION); /* delete tuple tail */
+					}
+				}
+			}
+			if (xlogState) /* Some page tuples were deleted */
+			{
+				if (pg->pd_flags & PD_PAGE_FULL)  /* Page was full: include it in allocation chain  */
+				{
+					UndamPageHeader* chain;
+
+					pg->pd_flags &= ~PD_PAGE_FULL;
+
+					if (chainBuf) /* check if allocation chain header is at the same page */
+					{
+						chain = (UndamPageHeader*)UndamModifyBuffer(rel, xlogState, chainBuf);
+						Assert(chain->head == relinfo->chains[chainNo].forks[MAIN_FORKNUM].head);
+					}
+					else
+					{
+						Assert(chainNo == block);
+						chain = pg;
+					}
+					/* Update chain header */
+					pg->next = chain->head;
+					chain->head = block;
+					relinfo->chains[chainNo].forks[MAIN_FORKNUM].head = block;
+				}
+				UndamXLogFinish(rel, xlogState);
+				UnlockReleaseBuffer(buf);
+				if (chainBuf)
+					UnlockReleaseBuffer(chainBuf);
+			}
+		}
 	}
 	elog(LOG, "UNDAM: vacuum of relation %s completed: " UINT64_FORMAT " visible for all tuples, " UINT64_FORMAT " dead tuples, " UINT64_FORMAT " frozen tuples, " UINT64_FORMAT " truncated UNDO chains, " UINT64_FORMAT " UNDO versions, " UINT64_FORMAT " deleted versions",
 		 RelationGetRelationName(rel), nVisibleForAllTuples, nDeadTuples, nFrozenTuples, nTruncatedUndoChains, nUndoVersions, nDeletedVersions);
 
-	UndamVacuumIndexes(rel, deadBitmap, nTuples, bstrategy);
 	/* TODO: update statistic, relfrozenxid,... */
 
 	free(deadBitmap);
