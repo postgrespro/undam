@@ -8,6 +8,7 @@
 #include "access/relscan.h"
 #include "access/skey.h"
 #include "access/tableam.h"
+#include "access/tsmapi.h"
 #include "access/visibilitymap.h"
 #include "access/xact.h"
 #include "catalog/index.h"
@@ -3199,14 +3200,103 @@ undam_index_validate_scan(Relation relation,
 static bool
 undam_scan_sample_next_block(TableScanDesc scan, SampleScanState *scanstate)
 {
-    NOT_IMPLEMENTED;
+    UndamScanDesc uscan = (UndamScanDesc) scan;
+	TsmRoutine *tsm = scanstate->tsmroutine;
+	BlockNumber blockno;
+
+	/* return false immediately if relation is empty */
+	if (tsm->NextSampleBlock)
+	{
+		blockno = tsm->NextSampleBlock(scanstate, uscan->lastBlock);
+	}
+	else
+	{
+		/* scanning table sequentially */
+		blockno = ItemPointerGetBlockNumberNoCheck(&uscan->currItem);
+		if (ItemPointerGetOffsetNumberNoCheck(&uscan->currItem) != 0)
+		{
+			blockno += 1;
+		}
+		if (blockno >= uscan->lastBlock)
+			return false;
+	}
+	ItemPointerSet(&uscan->currItem, blockno, 1);
+	return true;
 }
 
 static bool
 undam_scan_sample_next_tuple(TableScanDesc scan, SampleScanState *scanstate,
                               TupleTableSlot *slot)
 {
-    NOT_IMPLEMENTED;
+    Relation      rel = scan->rs_rd;
+	TsmRoutine   *tsm = scanstate->tsmroutine;
+	UndamRelationInfo *relinfo = UndamGetRelationInfo(rel);
+    UndamScanDesc uscan = (UndamScanDesc) scan;
+	BlockNumber   blocknum = ItemPointerGetBlockNumber(&uscan->currItem);
+	int           nChunks = CHUNKS_PER_BLOCK;
+	Buffer        buf = UndamReadBuffer(rel, MAIN_FORKNUM, blocknum);
+	UndamPageHeader* pg = (UndamPageHeader*)BufferGetPage(buf);
+
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+
+	for (;;)
+	{
+		int item;
+
+		CHECK_FOR_INTERRUPTS();
+
+		/* Ask the tablesample method which tuples to check on this page. */
+		item = tsm->NextSampleTuple(scanstate,
+									blocknum,
+									nChunks);
+		if (pg->allocMask[item >> 6] & ((uint64)1 << (item & 63))) /* item was allocated */
+		{
+			UndamTupleHeader* tup = (UndamTupleHeader*)((char*)pg + item*CHUNK_SIZE);
+			HeapTupleData tuphdr;
+			int len = tup->size;
+			bool visible;
+
+			tuphdr.t_tableOid = RelationGetRelid(rel);
+			tuphdr.t_data = &tup->hdr;
+			tuphdr.t_len = len;
+			ItemPointerSet(&tuphdr.t_self, blocknum, item);
+
+			visible = HeapTupleSatisfiesVisibility(&tuphdr, scan->rs_snapshot, buf);
+
+			/* in pagemode, heapgetpage did this for us */
+#if PG_VERSION_NUM >= 130000
+			HeapCheckForSerializableConflictOut(visible, scan->rs_rd, &tuphdr,
+												buf, scan->rs_snapshot);
+#else
+			CheckForSerializableConflictOut(scan->rs_rd, GetTopTransactionIdIfAny(), scan->rs_snapshot);
+#endif
+
+			/* Try next tuple from same page. */
+			if (!visible)
+				continue;
+
+			/* Found visible tuple, return it. */
+			UnlockReleaseBuffer(buf);
+
+			ExecStoreHeapTuple(&tuphdr, slot, true);
+
+			/* Count successfully-fetched tuples as heap fetches */
+			pgstat_count_heap_getnext(scan->rs_rd);
+
+			return true;
+		}
+		else
+		{
+			/*
+			 * If we get here, it means we've exhausted the items on this page
+			 * and it's time to move to the next.
+			 */
+			UnlockReleaseBuffer(buf);
+
+			ExecClearTuple(slot);
+			return false;
+		}
+	}
 }
 
 /*
