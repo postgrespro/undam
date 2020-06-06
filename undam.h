@@ -120,6 +120,8 @@ typedef struct
     TableScanDescData   base;
 	BlockNumber         lastBlock; /* last block until we should scan */
     ItemPointerData     currItem;  /* current block numbder */
+	Buffer              currBuf;   /* currently used buffer (pinned) */
+	UndamRelationInfo*  relinfo;   /* scanned relation info */
 } UndamScanDescData;
 typedef UndamScanDescData* UndamScanDesc;
 

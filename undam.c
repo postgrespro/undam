@@ -530,9 +530,8 @@ UndamUpdateTuple(Relation rel, HeapTuple tuple, Buffer buffer)
  * Otherwise returns unattached heap tuple (not pinning any buffer).
  */
 static HeapTuple
-UndamReadTuple(Relation rel, Snapshot snapshot, ItemPointer ip)
+UndamReadTuple(UndamRelationInfo* relinfo, Relation rel, Snapshot snapshot, ItemPointer ip, Buffer currBuf)
 {
-	UndamRelationInfo* relinfo = UndamGetRelationInfo(rel);
 	BlockNumber blocknum = BlockIdGetBlockNumber(&ip->ip_blkid);
 	int offs = ip->ip_posid*CHUNK_SIZE;
 	int forknum = MAIN_FORKNUM; /* Start from main fork */
@@ -543,12 +542,13 @@ UndamReadTuple(Relation rel, Snapshot snapshot, ItemPointer ip)
 	relinfo->nScannedTuples += 1;
 	do
 	{
-		Buffer buf = UndamReadBuffer(rel, forknum, blocknum);
+		Buffer buf = currBuf == InvalidBuffer ? UndamReadBuffer(rel, forknum, blocknum) : currBuf;
 		UndamPageHeader* pg = (UndamPageHeader*)BufferGetPage(buf);
 		UndamTupleHeader* tup = (UndamTupleHeader*)((char*)pg + offs);
 		int len;
 
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		if (currBuf == InvalidBuffer)
+			LockBuffer(buf, BUFFER_LOCK_SHARE);
 
 		len = tup->size;
 		tuphdr.t_data = &tup->hdr;
@@ -595,9 +595,11 @@ UndamReadTuple(Relation rel, Snapshot snapshot, ItemPointer ip)
 					relinfo->nScannedChunks += 1;
 				} while (len > 0);
 			}
-			UnlockReleaseBuffer(buf);
+			if (currBuf == InvalidBuffer)
+				UnlockReleaseBuffer(buf);
 			return tuple;
 		}
+		currBuf = InvalidBuffer;
 		blocknum = POSITION_GET_BLOCK_NUMBER(tup->undoChain);
 		offs = POSITION_GET_BLOCK_OFFSET(tup->undoChain);
 		UnlockReleaseBuffer(buf);
@@ -1420,8 +1422,44 @@ undam_beginscan(Relation relation, Snapshot snapshot,
     scan->base.rs_flags = flags;
 	scan->base.rs_parallel = parallel_scan;
 	scan->lastBlock = UndamGetLastBlock(relation, MAIN_FORKNUM);
+	scan->currBuf = InvalidBuffer;
+	scan->relinfo = UndamGetRelationInfo(relation);
 	ItemPointerSet(&scan->currItem, 0, 0);
     return (TableScanDesc) scan;
+}
+
+static void UndamUnlockReleaseCurrentBuffer(UndamScanDesc uscan)
+{
+	if (uscan->currBuf != InvalidBuffer)
+	{
+		UnlockReleaseBuffer(uscan->currBuf);
+		uscan->currBuf = InvalidBuffer;
+	}
+}
+
+static void UndamReleaseCurrentBuffer(UndamScanDesc uscan)
+{
+	if (uscan->currBuf != InvalidBuffer)
+	{
+		ReleaseBuffer(uscan->currBuf);
+		uscan->currBuf = InvalidBuffer;
+	}
+}
+
+static void UndamUnlockCurrentBuffer(UndamScanDesc uscan)
+{
+	Assert(uscan->currBuf != InvalidBuffer);
+	LockBuffer(uscan->currBuf, BUFFER_LOCK_UNLOCK);
+}
+
+static Buffer UndamGetCurrentBuffer(UndamScanDesc uscan, BlockNumber blocknum)
+{
+	if (uscan->currBuf == InvalidBuffer)
+	{
+		uscan->currBuf = UndamReadBuffer(uscan->base.rs_rd, MAIN_FORKNUM, blocknum);
+	}
+	LockBuffer(uscan->currBuf, BUFFER_LOCK_SHARE);
+	return uscan->currBuf;
 }
 
 static bool
@@ -1429,7 +1467,7 @@ undam_getnextslot(TableScanDesc scan, ScanDirection direction, TupleTableSlot *s
 {
     UndamScanDesc uscan = (UndamScanDesc) scan;
     Relation      rel = scan->rs_rd;
-	UndamRelationInfo* relinfo = UndamGetRelationInfo(rel);
+	UndamRelationInfo* relinfo = uscan->relinfo;
 	HeapTuple     tuple;
 	int           item = ItemPointerGetOffsetNumberNoCheck(&uscan->currItem); /* next item to try */
 	BlockNumber   blocknum = ItemPointerGetBlockNumberNoCheck(&uscan->currItem);
@@ -1444,32 +1482,31 @@ undam_getnextslot(TableScanDesc scan, ScanDirection direction, TupleTableSlot *s
 
 		table_block_parallelscan_startblock_init(scan->rs_rd, pbscan);
 		blocknum = table_block_parallelscan_nextpage(scan->rs_rd, pbscan);
+		UndamReleaseCurrentBuffer(uscan);
 	}
 	item += 1;
 	while (blocknum < uscan->lastBlock)
 	{
-		Buffer buf = UndamReadBuffer(rel, MAIN_FORKNUM, blocknum);
+		Buffer buf = UndamGetCurrentBuffer(uscan, blocknum);
 		UndamPageHeader* pg = (UndamPageHeader*)BufferGetPage(buf);
-
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
 
 		while (item < nChunks)
 		{
 			if (pg->allocMask[item >> 6] & ((uint64)1 << (item & 63))) /* chunk is allocated */
 			{
 				ItemPointerSet(&uscan->currItem, blocknum, item);
-				tuple = UndamReadTuple(scan->rs_rd, scan->rs_snapshot, &uscan->currItem);
+				tuple = UndamReadTuple(relinfo, rel, scan->rs_snapshot, &uscan->currItem, buf);
 				if (tuple != NULL) /* Found some visible version */
 				{
 					ExecStoreHeapTuple(tuple, slot, true);
-					UnlockReleaseBuffer(buf);
 					ItemPointerSetOffsetNumber(&uscan->currItem, item);
+					UndamUnlockCurrentBuffer(uscan);
 					return true;
 				}
 			}
 			item += 1;
 		}
-		UnlockReleaseBuffer(buf);
+		UndamUnlockReleaseCurrentBuffer(uscan);
 		if (pbscan != NULL)
 			blocknum = table_block_parallelscan_nextpage(scan->rs_rd, pbscan);
 		else
@@ -1490,6 +1527,7 @@ undam_rescan(TableScanDesc scan, ScanKey key, bool set_params,
 static void
 undam_endscan(TableScanDesc scan)
 {
+	UndamUnlockReleaseCurrentBuffer((UndamScanDesc)scan);
     /*
      * decrement relation reference count and free scan descriptor storage
      */
@@ -1530,7 +1568,7 @@ undam_index_fetch_tuple(struct IndexFetchTableData *scan,
 						TupleTableSlot *slot,
 						bool *call_again, bool *all_dead)
 {
-	HeapTuple tuple = UndamReadTuple(scan->rel, snapshot, tid);
+	HeapTuple tuple = UndamReadTuple(UndamGetRelationInfo(scan->rel), scan->rel, snapshot, tid, InvalidBuffer);
 	if (tuple != NULL) /* found some visible version */
 	{
 		ExecStoreHeapTuple(tuple, slot, true);
@@ -1555,7 +1593,7 @@ undam_scan_bitmap_next_tuple(TableScanDesc scan,
 {
     UndamScanDesc uscan = (UndamScanDesc) scan;
     Relation      rel = scan->rs_rd;
-	UndamRelationInfo* relinfo = UndamGetRelationInfo(rel);
+	UndamRelationInfo* relinfo = uscan->relinfo;
 	HeapTuple     tuple;
 	int           offs = ItemPointerGetOffsetNumber(&uscan->currItem);
 	BlockNumber   blocknum = tbmres->blockno;
@@ -1588,7 +1626,7 @@ undam_scan_bitmap_next_tuple(TableScanDesc scan,
 		if (pg->allocMask[item >> 6] & ((uint64)1 << (item & 63))) /* chunk is allocated */
 		{
 			ItemPointerSetOffsetNumber(&uscan->currItem, item);
-			tuple = UndamReadTuple(scan->rs_rd, scan->rs_snapshot, &uscan->currItem);
+			tuple = UndamReadTuple(relinfo, rel, scan->rs_snapshot, &uscan->currItem, InvalidBuffer);
 			if (tuple != NULL) /* found some visible tuple */
 			{
 				found = true;
@@ -1608,7 +1646,7 @@ undam_fetch_row_version(Relation relation,
 						Snapshot snapshot,
 						TupleTableSlot *slot)
 {
-	HeapTuple tuple = UndamReadTuple(relation, snapshot, tid);
+	HeapTuple tuple = UndamReadTuple(UndamGetRelationInfo(relation), relation, snapshot, tid, InvalidBuffer);
 	if (tuple != NULL) /* found some visible tuple */
 	{
 		ExecStoreHeapTuple(tuple, slot, true);
@@ -1889,7 +1927,7 @@ undam_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
 				 errmsg("cannot update tuples during a parallel operation")));
 
 	key_attrs = RelationGetIndexAttrBitmap(relation, INDEX_ATTR_BITMAP_KEY);
-	origtup = UndamReadTuple(relation, snapshot, otid);
+	origtup = UndamReadTuple(relinfo, relation, snapshot, otid, InvalidBuffer);
 	Assert(origtup != NULL);
 	modified_attrs = HeapDetermineModifiedColumns(relation, key_attrs,
 												  origtup, newtup);
@@ -2197,7 +2235,7 @@ undam_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
 	heap_acquire_tuplock(relation, tid, mode,
 						 wait_policy, &have_tuple_lock);
 
-	tuple = UndamReadTuple(relation, SnapshotAny, tid);
+	tuple = UndamReadTuple(UndamGetRelationInfo(relation), relation, SnapshotAny, tid, InvalidBuffer);
 	if (tuple != NULL) /* found some visible version */
 	{
 		ExecStoreHeapTuple(tuple, slot, true);
