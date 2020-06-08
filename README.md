@@ -33,3 +33,5 @@ List with index K is used for allocation of pages which (blockno % undam.alloc_c
 Undam storage is using generic WAL messages to provide ACID transaction behavior.
 As far as it never shift data on the page, generic WAL messages delta calculation mechanism
 is quite efficient in this case.
+
+[UNDAM presentation](https://docs.google.com/presentation/d/1ho7NFVY02WHyGfYz-30NmhbhzaA7yzYCPOQTgS6p3XI/edit?usp=sharing)
