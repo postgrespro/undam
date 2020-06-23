@@ -583,7 +583,8 @@ UndamReadTuple(UndamRelationInfo* relinfo, Relation rel, Snapshot snapshot, Item
 				do {
 					UndamTupleChunk* chunk;
 					Assert(next != INVALID_POSITION);
-					UnlockReleaseBuffer(buf);
+					if (buf != currBuf)
+						UnlockReleaseBuffer(buf);
 					buf = UndamReadBuffer(rel, EXT_FORKNUM, POSITION_GET_BLOCK_NUMBER(next));
 					pg = (UndamPageHeader*)BufferGetPage(buf);
 					chunk = (UndamTupleChunk*)((char*)pg + POSITION_GET_BLOCK_OFFSET(next));
@@ -595,14 +596,15 @@ UndamReadTuple(UndamRelationInfo* relinfo, Relation rel, Snapshot snapshot, Item
 					relinfo->nScannedChunks += 1;
 				} while (len > 0);
 			}
-			if (currBuf == InvalidBuffer)
+			if (buf != currBuf)
 				UnlockReleaseBuffer(buf);
 			return tuple;
 		}
-		currBuf = InvalidBuffer;
 		blocknum = POSITION_GET_BLOCK_NUMBER(tup->undoChain);
 		offs = POSITION_GET_BLOCK_OFFSET(tup->undoChain);
-		UnlockReleaseBuffer(buf);
+		if (buf != currBuf)
+			UnlockReleaseBuffer(buf);
+		currBuf = InvalidBuffer;
 		forknum = EXT_FORKNUM; /* undo chain is in extension fork */
 	}
 	while (blocknum != InvalidBlockNumber);
