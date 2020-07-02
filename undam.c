@@ -3414,13 +3414,10 @@ void _PG_init(void)
 	/*
 	 * In order to create our shared memory area, we have to be loaded via
 	 * shared_preload_libraries.  If not, fall out without hooking into any of
-	 * the main system.  (We don't throw error here because it seems useful to
-	 * allow the undam functions to be created even when the
-	 * module isn't active.  The functions must protect themselves against
-	 * being called then, however.)
+	 * the main system.
 	 */
 	if (!process_shared_preload_libraries_in_progress)
-		return;
+		elog(ERROR, "undam should be added to shared_preload_libraries");
 
 	UndamReloptKind = add_reloption_kind();
 #if PG_VERSION_NUM >= 130000
