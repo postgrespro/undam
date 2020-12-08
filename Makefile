@@ -6,6 +6,7 @@ EXTENSION = undam
 DATA = undam--0.1.sql
 
 REGRESS = undam
+REGRESS_OPTS = --temp-config $(top_srcdir)/contrib/undam/undam.conf
 
 ifdef USE_PGXS
 PG_CONFIG ?= pg_config
