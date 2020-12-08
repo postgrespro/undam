@@ -489,12 +489,19 @@ UndamUpdateTuple(Relation rel, HeapTuple tuple, Buffer buffer)
 	int len = Min(old->size, available);
 	UndamPosition undo = old->undoChain;
 	UndamPosition truncateChain = INVALID_POSITION;
+#if PG_VERSION_NUM >= 140000
+	GlobalVisState *vistest = GlobalVisTestFor(rel);
+#endif
 	Assert(len > 0);
 
 	if (undo != INVALID_POSITION)
 	{
 		if (HeapTupleHeaderXminFrozen(&old->hdr)
+#if PG_VERSION_NUM >= 140000
+			|| GlobalVisTestIsRemovableXid(vistest, HeapTupleHeaderGetRawXmin(&old->hdr)))
+#else
 			|| TransactionIdPrecedes(HeapTupleHeaderGetRawXmin(&old->hdr), RecentGlobalXmin))
+#endif
 		{
 			/* Updated version is visible for everybody: truncate its undo chain */
 			truncateChain = undo;
@@ -1481,9 +1488,13 @@ undam_getnextslot(TableScanDesc scan, ScanDirection direction, TupleTableSlot *s
 
 	if (pbscan != NULL && item == 0)
 	{
-
+#if PG_VERSION_NUM >= 140000
+		table_block_parallelscan_startblock_init(scan->rs_rd, scan->rs_private, pbscan);
+		blocknum = table_block_parallelscan_nextpage(scan->rs_rd, scan->rs_private, pbscan);
+#else
 		table_block_parallelscan_startblock_init(scan->rs_rd, pbscan);
 		blocknum = table_block_parallelscan_nextpage(scan->rs_rd, pbscan);
+#endif
 		UndamReleaseCurrentBuffer(uscan);
 	}
 	item += 1;
@@ -1510,7 +1521,13 @@ undam_getnextslot(TableScanDesc scan, ScanDirection direction, TupleTableSlot *s
 		}
 		UndamUnlockReleaseCurrentBuffer(uscan);
 		if (pbscan != NULL)
+		{
+#if PG_VERSION_NUM >= 140000
+			blocknum = table_block_parallelscan_nextpage(scan->rs_rd, scan->rs_private, pbscan);
+#else
 			blocknum = table_block_parallelscan_nextpage(scan->rs_rd, pbscan);
+#endif
+		}
 		else
 			blocknum += 1;
 		item = 1; /* first chunk is used for page header, so skip it */
@@ -2777,9 +2794,13 @@ undam_relation_nontransactional_truncate(Relation rel)
 	 * Make sure smgr_targblock etc aren't pointing somewhere past new end
 	 */
 	rel->rd_smgr->smgr_targblock = InvalidBlockNumber;
+#if PG_VERSION_NUM >= 140000
+	for (int i = 0; i <= MAX_FORKNUM; ++i)
+		rel->rd_smgr->smgr_cached_nblocks[i] = InvalidBlockNumber;
+#else
 	rel->rd_smgr->smgr_fsm_nblocks = InvalidBlockNumber;
 	rel->rd_smgr->smgr_vm_nblocks = InvalidBlockNumber;
-
+#endif
 	relinfo->chunkSize = chunkSize;
 	relinfo->nChains = UndamNAllocChains;
 
@@ -3115,8 +3136,13 @@ undam_index_build_range_scan(Relation rel,
 
     /* okay to ignore lazy VACUUMs here */
     if (!IsBootstrapProcessingMode() && !indexInfo->ii_Concurrent)
+	{
+#if PG_VERSION_NUM >= 140000
+        OldestXmin = GetOldestNonRemovableTransactionId(rel);
+#else
         OldestXmin = GetOldestXmin(rel, PROCARRAY_FLAGS_VACUUM);
-
+#endif
+	}
     if (!scan)
     {
         /*
